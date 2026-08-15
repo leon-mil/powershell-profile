@@ -5276,6 +5276,129 @@ function global:Expand-DirectoryArchive {
     }
 }
 
+function global:Clear-DirectoryContents {
+    <#
+    .SYNOPSIS
+        Removes all contents from a directory while preserving the directory.
+
+    .DESCRIPTION
+        Deletes all files, hidden items, and subdirectories contained within
+        the specified directory.
+
+        The target directory itself is preserved.
+
+        If no path is supplied, the current directory is used.
+
+        The function supports -WhatIf and -Confirm and refuses to clear a
+        filesystem root such as C:\.
+
+    .PARAMETER Path
+        Directory whose contents should be removed.
+
+        Defaults to the current directory.
+
+    .EXAMPLE
+        clear-dir
+
+        Clears the current directory.
+
+    .EXAMPLE
+        clear-dir "C:\Users\mil00001\Pictures\Screenshots"
+
+        Removes everything inside the Screenshots directory while preserving
+        the Screenshots directory itself.
+
+    .EXAMPLE
+        clear-dir "C:\Users\mil00001\Pictures\Screenshots" -WhatIf
+
+        Previews what would be removed without deleting anything.
+
+    .EXAMPLE
+        clear-dir .\temp -Confirm
+
+        Clears the temp directory and explicitly requests confirmation.
+    #>
+
+    [CmdletBinding(
+        SupportsShouldProcess = $true,
+        ConfirmImpact = 'Medium'
+    )]
+    param(
+        [Parameter(
+            Position = 0,
+            ValueFromPipeline,
+            ValueFromPipelineByPropertyName
+        )]
+        [ValidateNotNullOrEmpty()]
+        [string]$Path = '.'
+    )
+
+    process {
+        $target = Get-Item `
+            -LiteralPath $Path `
+            -Force `
+            -ErrorAction Stop
+
+        if (-not $target.PSIsContainer) {
+            throw "Path is not a directory: $($target.FullName)"
+        }
+
+        $fullPath = $target.FullName
+
+        $rootPath = [System.IO.Path]::GetPathRoot($fullPath)
+
+        if (
+            $fullPath.TrimEnd('\') -eq
+            $rootPath.TrimEnd('\')
+        ) {
+            throw (
+                "Refusing to clear filesystem root: $fullPath"
+            )
+        }
+
+        $items = @(
+            Get-ChildItem `
+                -LiteralPath $fullPath `
+                -Force `
+                -ErrorAction Stop
+        )
+
+        if ($items.Count -eq 0) {
+            Write-Host "Directory is already empty: $fullPath"
+            return
+        }
+
+        Write-Host ''
+        Write-Host 'CLEAR DIRECTORY' -ForegroundColor Cyan
+        Write-Host '===============' -ForegroundColor Cyan
+        Write-Host "Directory: $fullPath"
+        Write-Host "Items:     $($items.Count)"
+        Write-Host ''
+
+        foreach ($item in $items) {
+            if (
+                $PSCmdlet.ShouldProcess(
+                    $item.FullName,
+                    'Remove'
+                )
+            ) {
+                Remove-Item `
+                    -LiteralPath $item.FullName `
+                    -Recurse `
+                    -Force `
+                    -ErrorAction Stop
+            }
+        }
+
+        if (-not $WhatIfPreference) {
+            Write-Host ''
+            Write-Host (
+                "Directory cleared successfully: $fullPath"
+            ) -ForegroundColor Green
+        }
+    }
+}
+
 function global:Get-AllChildItem {
     <#
     .SYNOPSIS
@@ -5539,6 +5662,64 @@ function global:Show-DirectoryTree {
     }
 }
 
+function global:Clear-UserRecycleBin {
+    <#
+    .SYNOPSIS
+        Empties the Windows Recycle Bin.
+
+    .DESCRIPTION
+        Permanently removes items currently stored in the Windows Recycle Bin
+        for the current user.
+
+        Supports -WhatIf and -Confirm so the operation can be previewed before
+        anything is permanently deleted.
+
+    .EXAMPLE
+        clear-bin
+
+        Empties the Recycle Bin.
+
+    .EXAMPLE
+        clear-bin -WhatIf
+
+        Previews the Recycle Bin operation without deleting anything.
+
+    .EXAMPLE
+        clear-bin -Confirm
+
+        Empties the Recycle Bin with explicit confirmation.
+    #>
+
+    [CmdletBinding(
+        SupportsShouldProcess = $true,
+        ConfirmImpact = 'High'
+    )]
+    param()
+
+    if ($null -eq (
+        Get-Command `
+            -Name Clear-RecycleBin `
+            -ErrorAction SilentlyContinue
+    )) {
+        throw 'Clear-RecycleBin is not available on this system.'
+    }
+
+    if (
+        $PSCmdlet.ShouldProcess(
+            'Windows Recycle Bin',
+            'Permanently remove all Recycle Bin contents'
+        )
+    ) {
+        Clear-RecycleBin `
+            -Force `
+            -ErrorAction Stop
+
+        Write-Host ''
+        Write-Host 'Recycle Bin cleared successfully.' `
+            -ForegroundColor Green
+    }
+}
+
 # =============================================================================
 # Alias registry and help menu
 # =============================================================================
@@ -5702,7 +5883,7 @@ function global:Get-ProfileAliasDefinition {
             Alias       = 'la'
             Command     = 'Get-AllChildItem'
             Description = 'List all files and directories, including hidden items'
-        }
+        }       
         [pscustomobject]@{
             Category    = 'Utilities'
             Alias       = 'up'
@@ -5792,6 +5973,18 @@ function global:Get-ProfileAliasDefinition {
             Alias       = 'unzip'
             Command     = 'Expand-DirectoryArchive'
             Description = 'Extract a ZIP using automatic destination selection'
+        }
+        [pscustomobject]@{
+            Category    = 'Utilities'
+            Alias       = 'clear-dir'
+            Command     = 'Clear-DirectoryContents'
+            Description = 'Remove all contents from a directory while preserving the directory'
+        }
+        [pscustomobject]@{
+            Category    = 'Utilities'
+            Alias       = 'clear-bin'
+            Command     = 'Clear-UserRecycleBin'
+            Description = 'Permanently empty the Windows Recycle Bin'
         }
 
 
