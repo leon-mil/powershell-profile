@@ -1,0 +1,47 @@
+@'
+# =============================================================================
+# PowerShell Profile Repository
+# =============================================================================
+
+# Separate development projects.
+# ProfileAliasPredictor will have its own Git repository.
+Projects/
+
+# Local PowerShell modules and scripts that are not part of this profile repo.
+Modules/
+Scripts/
+
+# Backup and archive output
+Backups/
+Archives/
+*.zip
+*.bak
+*.backup
+
+# Temporary and log files
+*.tmp
+*.temp
+*.log
+*.err
+*.out
+
+# .NET build artifacts, in case a project is ever created below this repository
+bin/
+obj/
+
+# Visual Studio / VS Code user-specific files
+.vs/
+.vscode/
+*.user
+*.suo
+
+# PowerShell analysis/cache artifacts
+PSScriptAnalyzerSettings.local.psd1
+
+# Windows system files
+Thumbs.db
+Desktop.ini
+
+# macOS files, harmless to ignore if repository is cloned elsewhere
+.DS_Store
+'@ | Set-Content -Path .\.gitignore -Encoding utf8
