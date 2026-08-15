@@ -130,34 +130,46 @@ function global:Get-ProfilePath {
 function global:Edit-Profile {
     <#
     .SYNOPSIS
-        Opens the main PowerShell profile for editing.
+        Opens the PowerShell development workspace in Visual Studio Code.
+
+    .DESCRIPTION
+        Opens the PowerShell.code-workspace file located in the main
+        PowerShell profile directory.
+
+        This provides access to the complete PowerShell development
+        environment instead of opening only profile.ps1.
 
     .EXAMPLE
-        Edit-Profile
+        eprof
     #>
 
     [CmdletBinding()]
     param()
 
-    $profilePath = $PROFILE.CurrentUserAllHosts
-    $profileDirectory = Split-Path -Path $profilePath -Parent
+    $workspacePath =
+        Join-Path `
+            (Split-Path $PROFILE.CurrentUserAllHosts -Parent) `
+            'PowerShell.code-workspace'
 
-    if (-not (Test-Path -LiteralPath $profileDirectory -PathType Container)) {
-        New-Item -ItemType Directory -Path $profileDirectory -Force |
-            Out-Null
+    if (-not (
+        Test-Path `
+            -LiteralPath $workspacePath `
+            -PathType Leaf
+    )) {
+        throw "PowerShell workspace not found: $workspacePath"
     }
 
-    if (-not (Test-Path -LiteralPath $profilePath -PathType Leaf)) {
-        New-Item -ItemType File -Path $profilePath -Force |
-            Out-Null
+    $codeCommand =
+        Get-Command code `
+            -ErrorAction SilentlyContinue
+
+    if ($null -eq $codeCommand) {
+        throw (
+            'Visual Studio Code command "code" was not found in PATH.'
+        )
     }
 
-    if ($null -ne (Get-Command code -ErrorAction SilentlyContinue)) {
-        & code $profilePath
-        return
-    }
-
-    Invoke-Item -LiteralPath $profilePath
+    & $codeCommand.Source $workspacePath
 }
 
 
