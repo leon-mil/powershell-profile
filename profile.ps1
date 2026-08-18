@@ -991,7 +991,7 @@ function global:Open-ProfileAliasPredictorProject {
         Open-ProfileAliasPredictorProject
 
     .EXAMPLE
-        predproj
+        epred
     #>
 
     [CmdletBinding()]
@@ -1244,74 +1244,223 @@ function global:Build-CprsRelease {
         Builds the CPRS client solution in Release mode.
 
     .DESCRIPTION
-        Locates the full Visual Studio MSBuild executable and builds the
-        CPRS .NET Framework solution in Release mode for the win-x86 runtime.
+        Builds the CPRS .NET Framework solution in Release mode.
 
-    .EXAMPLE
-        Build-CprsRelease
+        The CPRS executable version is generated from the Git commit count:
 
-    .EXAMPLE
-        cprs-build
+            1.0.<commit count>.0
+
+        Example:
+
+            Git commit count: 341
+            CPRS version:     1.0.341.0
+
+        AssemblyInfo.cs is modified only during the build and is restored
+        immediately afterward.
     #>
 
     [CmdletBinding()]
     param()
 
-    $solutionPath = 'C:\Development-CPRS\Cprs\cprs-client.sln'
-    $outputDirectory = 'C:\Development-CPRS\Cprs\UI\bin\Release'
-    $executablePath = Join-Path $outputDirectory 'Cprs.exe'
+    $repositoryRoot =
+        'C:\Development-CPRS\Cprs'
 
-    $vsWherePath = Join-Path `
-        ${env:ProgramFiles(x86)} `
-        'Microsoft Visual Studio\Installer\vswhere.exe'
+    $solutionPath =
+        Join-Path $repositoryRoot 'cprs-client.sln'
 
-    if (-not (Test-Path -LiteralPath $solutionPath -PathType Leaf)) {
+    $assemblyInfoPath =
+        Join-Path $repositoryRoot 'UI\Properties\AssemblyInfo.cs'
+
+    $outputDirectory =
+        Join-Path $repositoryRoot 'UI\bin\Release'
+
+    $executablePath =
+        Join-Path $outputDirectory 'Cprs.exe'
+
+    $vsWherePath =
+        Join-Path `
+            ${env:ProgramFiles(x86)} `
+            'Microsoft Visual Studio\Installer\vswhere.exe'
+
+    # -------------------------------------------------------------------------
+    # Validate required files
+    # -------------------------------------------------------------------------
+
+    if (-not (
+        Test-Path `
+            -LiteralPath $solutionPath `
+            -PathType Leaf
+    )) {
         throw "CPRS solution was not found: $solutionPath"
     }
 
-    if (-not (Test-Path -LiteralPath $vsWherePath -PathType Leaf)) {
+    if (-not (
+        Test-Path `
+            -LiteralPath $assemblyInfoPath `
+            -PathType Leaf
+    )) {
+        throw "CPRS AssemblyInfo.cs was not found: $assemblyInfoPath"
+    }
+
+    if (-not (
+        Test-Path `
+            -LiteralPath $vsWherePath `
+            -PathType Leaf
+    )) {
         throw "Visual Studio locator was not found: $vsWherePath"
     }
 
-    $msBuildPath = & $vsWherePath `
-        -latest `
-        -products '*' `
-        -requires Microsoft.Component.MSBuild `
-        -find 'MSBuild\**\Bin\MSBuild.exe' |
+    if (-not (
+        Get-Command git -ErrorAction SilentlyContinue
+    )) {
+        throw 'Git was not found.'
+    }
+
+    # -------------------------------------------------------------------------
+    # Generate version from Git commit count
+    # -------------------------------------------------------------------------
+
+    $gitCommitCount =
+        & git `
+            -C $repositoryRoot `
+            rev-list `
+            --count `
+            HEAD
+
+    if (
+        $LASTEXITCODE -ne 0 -or
+        [string]::IsNullOrWhiteSpace($gitCommitCount)
+    ) {
+        throw 'Unable to determine the CPRS Git commit count.'
+    }
+
+    $gitCommitCount =
+        ([string]$gitCommitCount).Trim()
+
+    $buildVersion =
+        "1.0.$gitCommitCount.0"
+
+    # -------------------------------------------------------------------------
+    # Locate MSBuild
+    # -------------------------------------------------------------------------
+
+    $msBuildPath =
+        & $vsWherePath `
+            -latest `
+            -products '*' `
+            -requires Microsoft.Component.MSBuild `
+            -find 'MSBuild\**\Bin\MSBuild.exe' |
         Select-Object -First 1
 
     if ([string]::IsNullOrWhiteSpace($msBuildPath)) {
         throw 'A compatible Visual Studio MSBuild installation was not found.'
     }
 
-    Write-Host ''
-    Write-Host 'Building CPRS in Release mode...' -ForegroundColor Cyan
-    Write-Host "Solution: $solutionPath"
-    Write-Host "MSBuild:  $msBuildPath"
-    Write-Host ''
+    # -------------------------------------------------------------------------
+    # Temporarily apply generated version
+    # -------------------------------------------------------------------------
 
-    & $msBuildPath `
-        $solutionPath `
-        /restore `
-        /t:Rebuild `
-        /p:Configuration=Release `
-        /p:RuntimeIdentifier=win-x86 `
-        /m:1
+    $originalAssemblyInfo =
+        [System.IO.File]::ReadAllBytes(
+            $assemblyInfoPath
+        )
 
-    if ($LASTEXITCODE -ne 0) {
-        throw "CPRS Release build failed with exit code $LASTEXITCODE."
+    try {
+        $assemblyText =
+            [System.IO.File]::ReadAllText(
+                $assemblyInfoPath
+            )
+
+        $assemblyText =
+            [regex]::Replace(
+                $assemblyText,
+                '(?m)^\s*\[assembly:\s*AssemblyVersion\("[^"]+"\)\]\s*$',
+                "[assembly: AssemblyVersion(`"$buildVersion`")]"
+            )
+
+        $assemblyText =
+            [regex]::Replace(
+                $assemblyText,
+                '(?m)^\s*\[assembly:\s*AssemblyFileVersion\("[^"]+"\)\]\s*$',
+                "[assembly: AssemblyFileVersion(`"$buildVersion`")]"
+            )
+
+        [System.IO.File]::WriteAllText(
+            $assemblyInfoPath,
+            $assemblyText
+        )
+
+        # ---------------------------------------------------------------------
+        # Build
+        # ---------------------------------------------------------------------
+
+        Write-Host ''
+        Write-Host 'Building CPRS in Release mode...' `
+            -ForegroundColor Cyan
+
+        Write-Host "Solution: $solutionPath"
+        Write-Host "Version:  $buildVersion"
+        Write-Host "MSBuild:  $msBuildPath"
+        Write-Host ''
+
+        & $msBuildPath `
+            $solutionPath `
+            /restore `
+            /t:Rebuild `
+            /p:Configuration=Release `
+            /p:RuntimeIdentifier=win-x86 `
+            /m:1
+
+        $buildExitCode =
+            $LASTEXITCODE
+
+        if ($buildExitCode -ne 0) {
+            throw (
+                "CPRS Release build failed with exit code " +
+                "$buildExitCode."
+            )
+        }
+
+        if (-not (
+            Test-Path `
+                -LiteralPath $executablePath `
+                -PathType Leaf
+        )) {
+            throw (
+                'The build succeeded, but Cprs.exe was not found: ' +
+                $executablePath
+            )
+        }
+    }
+    finally {
+        # Restore the original tracked AssemblyInfo.cs exactly as it was.
+        [System.IO.File]::WriteAllBytes(
+            $assemblyInfoPath,
+            $originalAssemblyInfo
+        )
     }
 
-    if (-not (Test-Path -LiteralPath $executablePath -PathType Leaf)) {
-        throw "The build succeeded, but Cprs.exe was not found: $executablePath"
+    # -------------------------------------------------------------------------
+    # Verify generated executable version
+    # -------------------------------------------------------------------------
+
+    $versionInfo =
+        [System.Diagnostics.FileVersionInfo]::GetVersionInfo(
+            $executablePath
+        )
+
+    if ($versionInfo.FileVersion -ne $buildVersion) {
+        throw (
+            'CPRS version verification failed. ' +
+            "Expected $buildVersion but Cprs.exe reports " +
+            "$($versionInfo.FileVersion)."
+        )
     }
 
-    $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo(
-        $executablePath
-    )
-
     Write-Host ''
-    Write-Host 'CPRS Release build succeeded.' -ForegroundColor Green
+    Write-Host 'CPRS Release build succeeded.' `
+        -ForegroundColor Green
+
     Write-Host "Version: $($versionInfo.FileVersion)"
     Write-Host "Output:  $outputDirectory"
     Write-Host ''
@@ -1320,10 +1469,359 @@ function global:Build-CprsRelease {
         Application     = 'CPRS'
         Configuration   = 'Release'
         Version         = $versionInfo.FileVersion
+        GitCommitCount  = [int]$gitCommitCount
         Solution        = $solutionPath
         OutputDirectory = $outputDirectory
         Executable      = $executablePath
         BuildTime       = Get-Date
+    }
+}
+
+function global:Get-CprsDeploymentEmailRecipients {
+    <#
+    .SYNOPSIS
+        Retrieves CPRS deployment email recipients from CCMAIL.
+    #>
+
+    [CmdletBinding()]
+    param(
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$JobFlag = 'DEV'
+    )
+
+    $sqlServer = 'SQLSL,5034'
+    $sqlDatabase = 'cprsdev'
+
+    $connectionString =
+        'Driver={ODBC Driver 17 for SQL Server};' +
+        "Server=$sqlServer;" +
+        "Database=$sqlDatabase;" +
+        'Trusted_Connection=Yes;'
+
+    $connection =
+        [System.Data.Odbc.OdbcConnection]::new(
+            $connectionString
+        )
+
+    $command = $null
+    $reader = $null
+
+    try {
+        $connection.Open()
+
+        $command =
+            $connection.CreateCommand()
+
+        $command.CommandText = @"
+SELECT DISTINCT
+    LTRIM(RTRIM(EMAIL)) AS EMAIL
+FROM dbo.CCMAIL
+WHERE JOBFLAG = ?
+  AND EMAIL IS NOT NULL
+  AND LTRIM(RTRIM(EMAIL)) <> ''
+ORDER BY EMAIL;
+"@
+
+        $parameter =
+            $command.Parameters.Add(
+                '@JobFlag',
+                [System.Data.Odbc.OdbcType]::VarChar,
+                20
+            )
+
+        $parameter.Value =
+            $JobFlag.Trim().ToUpperInvariant()
+
+        $reader =
+            $command.ExecuteReader()
+
+        $recipients = @()
+
+        while ($reader.Read()) {
+
+            $email =
+                ([string]$reader['EMAIL']).Trim()
+
+            if (-not [string]::IsNullOrWhiteSpace($email)) {
+                $recipients += $email
+            }
+        }
+
+        $recipients =
+            @(
+                $recipients |
+                    Sort-Object -Unique
+            )
+
+        if ($recipients.Count -eq 0) {
+            throw (
+                "No email recipients were found in dbo.CCMAIL " +
+                "for JOBFLAG='$($JobFlag.ToUpperInvariant())'."
+            )
+        }
+
+        $invalidRecipients =
+            @(
+                $recipients |
+                    Where-Object {
+                        $_ -notmatch `
+                            '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
+                    }
+            )
+
+        if ($invalidRecipients.Count -gt 0) {
+            throw (
+                'Invalid email recipient value(s) returned by CCMAIL: ' +
+                ($invalidRecipients -join ', ')
+            )
+        }
+
+        return $recipients
+    }
+    finally {
+
+        if ($reader) {
+            $reader.Dispose()
+        }
+
+        if ($command) {
+            $command.Dispose()
+        }
+
+        if ($connection) {
+            $connection.Dispose()
+        }
+    }
+}
+
+function global:Send-CprsDeploymentEmail {
+    <#
+    .SYNOPSIS
+        Sends CPRS deployment statistics by HTML email.
+    #>
+
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [psobject]$Statistics,
+
+        [Parameter(Mandatory)]
+        [string[]]$Recipients
+    )
+
+    $smtpServer = 'mailout.census.gov'
+    $smtpPort = 25
+    $fromAddress = 'leon.mil@census.gov'
+    $fromName = 'CPRS Deployment'
+
+    if (-not $Recipients -or $Recipients.Count -eq 0) {
+        Write-Warning 'No CPRS deployment email recipients are configured.'
+        return
+    }
+
+    $subject =
+        "[CPRS $($Statistics.DeploymentRoute)] Client Deployment - $($Statistics.Status)"
+
+    function ConvertTo-HtmlValue {
+        param(
+            [object]$Value
+        )
+
+        return [System.Net.WebUtility]::HtmlEncode(
+            [string]$Value
+        )
+    }
+
+    # -------------------------------------------------------------------------
+    # Deployment statistics
+    # -------------------------------------------------------------------------
+
+    $rows = @(
+        ,@('Deployment Route', $Statistics.DeploymentRoute)
+        ,@('Source Environment', $Statistics.SourceEnvironment)
+        ,@('Target Environment', $Statistics.TargetEnvironment)
+        ,@('Status', $Statistics.Status)
+        ,@('Deployment Message', $Statistics.DeploymentMessage)
+        ,@('Version', $Statistics.Version)
+        ,@('Build', $Statistics.Build)
+    )
+
+    if (
+        -not [string]::IsNullOrWhiteSpace(
+            [string]$Statistics.GitBranch
+        )
+    ) {
+        $rows += ,@(
+            'Git Branch',
+            $Statistics.GitBranch
+        )
+    }
+
+    if (
+        -not [string]::IsNullOrWhiteSpace(
+            [string]$Statistics.GitCommit
+        )
+    ) {
+        $rows += ,@(
+            'Git Commit',
+            $Statistics.GitCommit
+        )
+    }
+
+    $rows += @(
+        ,@('Files Deployed', $Statistics.FilesDeployed)
+        ,@('Deployment Size', "$($Statistics.DeploymentSizeMB) MB")
+        ,@('Started', $Statistics.Started)
+        ,@('Completed', $Statistics.Completed)
+        ,@('Total Duration', $Statistics.Duration)
+        ,@('Source', $Statistics.Source)
+        ,@('Destination', $Statistics.Destination)
+        ,@('Archive Root', $Statistics.ArchiveRoot)
+        ,@('Archived To', $Statistics.ArchivedTo)
+    )
+
+    $tableRows = foreach ($row in $rows) {
+        $rowName =
+            [string]$row[0]
+
+        $name =
+            ConvertTo-HtmlValue $rowName
+
+        $value =
+            ConvertTo-HtmlValue $row[1]
+
+        $rowStyle =
+            if ($rowName -eq 'Deployment Message') {
+                'background:#fafafa;'
+            }
+            else {
+                ''
+            }
+
+        (
+            '<tr style="{0}">' +
+            '<td nowrap style="width:180px;white-space:nowrap;padding:8px 12px;border-bottom:1px solid #e5e7eb;font-weight:600;vertical-align:top;">{1}</td>' +
+            '<td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;vertical-align:top;">{2}</td>' +
+            '</tr>'
+        ) -f $rowStyle, $name, $value
+    }
+
+    # -------------------------------------------------------------------------
+    # HTML email
+    # -------------------------------------------------------------------------
+
+    $statusHtml =
+        ConvertTo-HtmlValue $Statistics.Status
+
+    $routeHtml =
+        ConvertTo-HtmlValue $Statistics.DeploymentRoute
+
+    $body = @(
+        '<!DOCTYPE html>'
+        '<html>'
+        '<body style="margin:0;padding:20px;background:#f3f4f6;font-family:Calibri,Arial,sans-serif;color:#111827;">'
+        ''
+        '<div style="max-width:850px;margin:auto;background:white;border:1px solid #d1d5db;">'
+        ''
+        '    <div style="background:#16365c;color:white;padding:20px 24px;">'
+        ''
+        '        <div style="font-size:22px;font-weight:bold;">'
+        '            CPRS Client Build & Deployment'
+        '        </div>'
+        ''
+        '        <div style="font-size:18px;font-weight:bold;margin-top:8px;">'
+        "            $statusHtml"
+        '        </div>'
+        ''
+        '        <div style="margin-top:6px;">'
+        "            $routeHtml"
+        '        </div>'
+        ''
+        '    </div>'
+        ''
+        '    <div style="padding:20px 24px;">'
+        ''
+        '        <table style="width:100%;border-collapse:collapse;font-size:14px;">'
+        ($tableRows -join [Environment]::NewLine)
+        '        </table>'
+        ''
+        '    </div>'
+        ''
+        '    <div style="padding:12px 24px;background:#f9fafb;border-top:1px solid #e5e7eb;font-size:12px;color:#6b7280;">'
+        '        Automated CPRS deployment notification.'
+        '    </div>'
+        ''
+        '</div>'
+        ''
+        '</body>'
+        '</html>'
+    ) -join [Environment]::NewLine
+
+    # -------------------------------------------------------------------------
+    # Send email
+    # -------------------------------------------------------------------------
+
+    $message = $null
+    $smtpClient = $null
+
+    try {
+        $message =
+            [System.Net.Mail.MailMessage]::new()
+
+        $message.From =
+            [System.Net.Mail.MailAddress]::new(
+                $fromAddress,
+                $fromName
+            )
+
+        foreach ($recipient in $Recipients) {
+            [void]$message.To.Add(
+                $recipient
+            )
+        }
+
+        $message.Subject = $subject
+        $message.Body = $body
+        $message.IsBodyHtml = $true
+
+        $smtpClient =
+            [System.Net.Mail.SmtpClient]::new(
+                $smtpServer,
+                $smtpPort
+            )
+
+        $smtpClient.EnableSsl = $false
+
+        $smtpClient.Send(
+            $message
+        )
+
+        Write-Host ''
+        Write-Host `
+            'Deployment email sent successfully.' `
+            -ForegroundColor Green
+
+        Write-Host "Recipients : $($Recipients -join '; ')"
+        Write-Host "Subject    : $subject"
+        Write-Host ''
+    }
+    catch {
+        # Deployment has already succeeded. Email failure must not change
+        # the deployment result.
+        Write-Warning (
+            'Deployment succeeded, but the email could not be sent: ' +
+            $_.Exception.Message
+        )
+    }
+    finally {
+        if ($message) {
+            $message.Dispose()
+        }
+
+        if ($smtpClient) {
+            $smtpClient.Dispose()
+        }
     }
 }
 
@@ -1339,24 +1837,24 @@ function global:Deploy-CprsTestClient {
 
         DEFAULT:
             Builds CPRS.
-            Archives the existing V:\TEST\EXE\Current build.
-            Replaces V:\TEST\EXE\Current.
+            Archives the existing V:\TEST\EXE\CPRS II build.
+            Replaces V:\TEST\EXE\CPRS II.
 
         -SkipBuild:
             Uses the existing local Release build.
-            Archives the existing Current build.
-            Replaces Current.
+            Archives the existing CPRS II build.
+            Replaces CPRS II.
 
         -Folder <folder>:
             Builds CPRS.
             Replaces V:\TEST\EXE\<folder>.
-            Does NOT modify Current.
-            Does NOT create a Current archive.
+            Does NOT modify CPRS II.
+            Does NOT create a CPRS II archive.
 
         -Folder <folder> -SkipBuild:
             Uses the existing Release build.
             Replaces V:\TEST\EXE\<folder>.
-            Does NOT modify Current.
+            Does NOT modify CPRS II.
 
         -WhatIf:
             Preview only.
@@ -1377,38 +1875,50 @@ function global:Deploy-CprsTestClient {
 
             V:\TEST\EXE\<folder>
 
-        When Folder is supplied, Current and Builds are not modified.
+        When Folder is supplied, CPRS II and Builds are not modified.
 
     .EXAMPLE
-        cprs-test-deploy
+        cprs-test-deploy `
+            -Message "CR2249 deployment"
 
-        Build CPRS, archive the existing Current build, and deploy the new
-        build to V:\TEST\EXE\Current.
-
-    .EXAMPLE
-        cprs-test-deploy -SkipBuild
-
-        Use the existing Release build, archive Current, and replace Current.
+        Build CPRS, archive the existing CPRS II build, and deploy the new
+        build to V:\TEST\EXE\CPRS II.
 
     .EXAMPLE
-        cprs-test-deploy -Folder <folder>
+        cprs-test-deploy `
+            -SkipBuild `
+            -Message "CR2249 deployment"
 
-        Build CPRS and replace V:\TEST\EXE\<folder>.
-        Current is not touched.
-
-    .EXAMPLE
-        cprs-test-deploy -Folder <folder> -SkipBuild
-
-        Use the existing Release build and replace
-        V:\TEST\EXE\<folder>.
+        Use the existing Release build, archive CPRS II, and replace CPRS II.
 
     .EXAMPLE
-        cprs-test-deploy -WhatIf
+        cprs-test-deploy `
+            -Folder CR2249 `
+            -Message "CR2249 deployment"
 
-        Preview a normal Current deployment without building or copying.
+        Build CPRS and replace V:\TEST\EXE\CR2249.
+        CPRS II is not touched.
 
     .EXAMPLE
-        cprs-test-deploy -Folder <folder> -WhatIf
+        cprs-test-deploy `
+            -Folder CR2249 `
+            -SkipBuild `
+            -Message "CR2249 deployment"
+
+        Use the existing Release build and replace V:\TEST\EXE\CR2249.
+
+    .EXAMPLE
+        cprs-test-deploy `
+            -Message "CR2249 deployment" `
+            -WhatIf
+
+        Preview a normal CPRS II deployment without building or copying.
+
+    .EXAMPLE
+        cprs-test-deploy `
+            -Folder CR2249 `
+            -Message "CR2249 deployment" `
+            -WhatIf
 
         Preview deployment to the CR2249 folder without making changes.
     #>
@@ -1422,7 +1932,11 @@ function global:Deploy-CprsTestClient {
 
         [Parameter()]
         [ValidateNotNullOrEmpty()]
-        [string]$Folder
+        [string]$Folder,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Message
     )
 
     $sourceDirectory =
@@ -1434,12 +1948,13 @@ function global:Deploy-CprsTestClient {
     $testRoot =
         'V:\TEST\EXE'
 
-    $currentDirectory =
-        Join-Path $testRoot 'Current'
+    $testApplicationDirectory =
+        Join-Path $testRoot 'CPRS II'
 
     $buildArchiveRoot =
         Join-Path $testRoot 'Builds'
 
+    $deploymentEmailJobFlag = 'DEPL'
 
     # -------------------------------------------------------------------------
     # Validate TEST deployment root
@@ -1483,10 +1998,10 @@ function global:Deploy-CprsTestClient {
             throw "Invalid folder name: $Folder"
         }
 
-        if ($Folder -in @('Current', 'Builds')) {
+        if ($Folder -in @('CPRS II', 'Builds')) {
             throw (
                 "'$Folder' is reserved. " +
-                'Omit -Folder to deploy to Current.'
+                'Omit -Folder to deploy to CPRS II.'
             )
         }
     }
@@ -1502,7 +2017,7 @@ function global:Deploy-CprsTestClient {
     }
     else {
         $destinationDirectory =
-            $currentDirectory
+            $testApplicationDirectory
     }
 
 
@@ -1530,11 +2045,11 @@ function global:Deploy-CprsTestClient {
 
     if ($isCustomFolder) {
         Write-Host 'Archive     : NO - custom TEST folder'
-        Write-Host 'Current     : NOT MODIFIED'
+        Write-Host 'CPRS II     : NOT MODIFIED'
     }
     else {
         Write-Host "Archive     : $buildArchiveRoot"
-        Write-Host 'Current     : REPLACED'
+        Write-Host 'CPRS II     : REPLACED'
     }
 
     Write-Host ''
@@ -1564,12 +2079,12 @@ function global:Deploy-CprsTestClient {
         if (
             -not $isCustomFolder -and
             (Test-Path `
-                -LiteralPath $currentDirectory `
+                -LiteralPath $testApplicationDirectory `
                 -PathType Container)
         ) {
             Write-Host ''
             Write-Host (
-                "WHAT IF: Existing $currentDirectory " +
+                "WHAT IF: Existing $testApplicationDirectory " +
                 'would be archived before replacement.'
             )
         }
@@ -1587,6 +2102,7 @@ function global:Deploy-CprsTestClient {
         return
     }
 
+    $deploymentStart = Get-Date
 
     # -------------------------------------------------------------------------
     # Build unless -SkipBuild was requested
@@ -1631,10 +2147,10 @@ function global:Deploy-CprsTestClient {
 
 
     # -------------------------------------------------------------------------
-    # Archive existing Current
+    # Archive existing CPRS II
     #
-    # Only normal Current deployments archive.
-    # Custom folders NEVER touch Current or Builds.
+    # Only normal CPRS II deployments archive.
+    # Custom folders NEVER touch CPRS II or Builds.
     # -------------------------------------------------------------------------
 
     $archiveDirectory = $null
@@ -1642,20 +2158,20 @@ function global:Deploy-CprsTestClient {
     if (
         -not $isCustomFolder -and
         (Test-Path `
-            -LiteralPath $currentDirectory `
+            -LiteralPath $testApplicationDirectory `
             -PathType Container)
     ) {
 
         $currentFiles =
             Get-ChildItem `
-                -LiteralPath $currentDirectory `
+                -LiteralPath $testApplicationDirectory `
                 -Force `
                 -ErrorAction Stop
 
         if ($currentFiles.Count -gt 0) {
 
             $currentExecutable =
-                Join-Path $currentDirectory 'Cprs.exe'
+                Join-Path $testApplicationDirectory 'Cprs.exe'
 
             $archiveVersion = 'unknown'
             $archiveHash = 'unknown'
@@ -1697,7 +2213,7 @@ function global:Deploy-CprsTestClient {
                 Join-Path $buildArchiveRoot $archiveName
 
 
-            Write-Host 'Archiving existing Current build...' `
+            Write-Host 'Archiving existing CPRS II build...' `
                 -ForegroundColor Cyan
 
             if (-not (
@@ -1721,7 +2237,7 @@ function global:Deploy-CprsTestClient {
                 Out-Null
 
             Get-ChildItem `
-                -LiteralPath $currentDirectory `
+                -LiteralPath $testApplicationDirectory `
                 -Force `
                 -ErrorAction Stop |
                 Copy-Item `
@@ -1790,6 +2306,137 @@ function global:Deploy-CprsTestClient {
         )
     }
 
+    # -------------------------------------------------------------------------
+    # Collect deployment statistics
+    # -------------------------------------------------------------------------
+
+    $deploymentEnd = Get-Date
+
+    $elapsed =
+        $deploymentEnd - $deploymentStart
+
+    $duration =
+        '{0:00}:{1:00}:{2:00}' -f `
+            [math]::Floor($elapsed.TotalHours),
+            $elapsed.Minutes,
+            $elapsed.Seconds
+
+    $deployedFiles = @(
+        Get-ChildItem `
+            -LiteralPath $destinationDirectory `
+            -File `
+            -Recurse `
+            -Force `
+            -ErrorAction Stop
+    )
+
+    $totalBytes =
+        (
+            $deployedFiles |
+                Measure-Object `
+                    -Property Length `
+                    -Sum
+        ).Sum
+
+    if ($null -eq $totalBytes) {
+        $totalBytes = 0
+    }
+
+    $deploymentSizeMB =
+        [math]::Round(
+            $totalBytes / 1MB,
+            2
+    )
+
+    # -------------------------------------------------------------------------
+    # Git information
+    # -------------------------------------------------------------------------
+
+    $repositoryRoot =
+        'C:\Development-CPRS\Cprs'
+
+    $gitBranch = 'UNKNOWN'
+    $gitCommit = 'UNKNOWN'
+
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+
+        $branch =
+            & git -C $repositoryRoot branch --show-current 2>$null
+
+        if ($LASTEXITCODE -eq 0 -and $branch) {
+            $gitBranch = ([string]$branch).Trim()
+        }
+
+        $commit =
+            & git -C $repositoryRoot rev-parse --short HEAD 2>$null
+
+        if ($LASTEXITCODE -eq 0 -and $commit) {
+            $gitCommit = ([string]$commit).Trim()
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # Build deployment statistics
+    # -------------------------------------------------------------------------
+
+    $deploymentStatistics =
+        [pscustomobject]@{
+            DeploymentRoute   = 'LOCAL -> TEST'
+            SourceEnvironment = 'LOCAL'
+            TargetEnvironment = 'TEST'
+            Status            = 'SUCCESS'
+            DeploymentMessage = $Message
+            Version           = $sourceVersion
+            Build             = if ($SkipBuild) {
+                'SKIPPED - existing Release build used'
+            }
+            else {
+                'Release build completed'
+            }
+            GitBranch         = $gitBranch
+            GitCommit         = $gitCommit
+            FilesDeployed     = $deployedFiles.Count
+            DeploymentSizeMB  = $deploymentSizeMB
+            Started           = $deploymentStart.ToString(
+                'MM/dd/yyyy hh:mm:ss tt'
+            )
+            Completed         = $deploymentEnd.ToString(
+                'MM/dd/yyyy hh:mm:ss tt'
+            )
+            Duration          = $duration
+            Source            = $sourceDirectory
+            Destination       = $destinationDirectory
+            ArchiveRoot       = $buildArchiveRoot
+            ArchivedTo        = if ($archiveDirectory) {
+                $archiveDirectory
+            }
+            elseif ($isCustomFolder) {
+                'Not archived - custom TEST folder'
+            }
+            else {
+                'No previous build required archiving'
+            }
+        }
+
+    # -------------------------------------------------------------------------
+    # Email deployment statistics
+    # -------------------------------------------------------------------------
+
+    try {
+        $deploymentEmailRecipients =
+            Get-CprsDeploymentEmailRecipients `
+                -JobFlag $deploymentEmailJobFlag
+
+        Send-CprsDeploymentEmail `
+            -Statistics $deploymentStatistics `
+            -Recipients $deploymentEmailRecipients
+    }
+    catch {
+        Write-Warning (
+            'Deployment succeeded, but CCMAIL recipients could not be loaded: ' +
+            $_.Exception.Message
+        )
+    }
 
     # -------------------------------------------------------------------------
     # Final result
@@ -1828,114 +2475,47 @@ function global:Deploy-CprsTestClient {
 function global:Deploy-CprsProductionClient {
     <#
     .SYNOPSIS
-        Promotes a verified CPRS TEST build to the CPRS production directory.
+        Promotes a verified CPRS TEST build to production.
 
     .DESCRIPTION
-        Promotes an existing CPRS client build from V:\TEST\EXE to:
+        Promotes an existing CPRS client build from:
 
-            V:\PROD\EXE\CPRS II
-
-        The production root is:
-
-            V:\PROD\EXE
-
-        Production build archives are stored separately under:
-
-            V:\PROD\EXE\Builds
-
-        The default TEST source is:
-
-            V:\TEST\EXE\Current
-
-        A TEST folder name can also be supplied:
-
-            cprs-prod-deploy -Source <folder>
-
-        which resolves to:
-
-            V:\TEST\EXE\<folder>
-
-        A complete TEST path is also accepted:
-
-            cprs-prod-deploy -Source 'V:\TEST\EXE\<folder>'
-
-        Before the live production application is replaced, the complete
-        contents of V:\PROD\EXE\CPRS II are copied to a timestamped archive
-        under V:\PROD\EXE\Builds and verified.
-
-        The selected TEST build is also staged and verified before the
-        production application is touched.
-
-        A production deployment requires two explicit confirmations:
-
-            1. Type REVIEWED
-            2. Type DEPLOY PROD
-
-        If the deployment fails after the live production replacement has
-        started, the function attempts to restore the archived production
-        build automatically.
-
-    .PARAMETER Source
-        Specifies the TEST build to promote.
-
-        If omitted:
-
-            V:\TEST\EXE\Current
-
-        If a folder name is supplied:
-
-            <folder>
-
-        it resolves to:
-
-            V:\TEST\EXE\<folder>
-
-        A complete directory under V:\TEST\EXE can also be supplied:
-
-            V:\TEST\EXE\<folder>
-
-        For safety, production promotion is restricted to directories
-        underneath V:\TEST\EXE.
-
-    .EXAMPLE
-        cprs-prod-deploy
-
-        Promotes V:\TEST\EXE\Current to:
-
-            V:\PROD\EXE\CPRS II
-
-    .EXAMPLE
-        cprs-prod-deploy -Source <folder>
-
-        Promotes:
-
-            V:\TEST\EXE\<folder>
+            V:\TEST\EXE\<Source>
 
         to:
 
+            V:\PROD\EXE\<DestinationFolder>
+
+        Defaults:
+
+            Source            = CPRS II
+            DestinationFolder = CPRS II
+
+        A custom production destination can be used for safe validation:
+
+            cprs-prod-deploy `
+                -DestinationFolder CR2249 `
+                -Message "CR2249 deployment"
+
+        This deploys to:
+
+            V:\PROD\EXE\CR2249
+
+        and does NOT modify:
+
             V:\PROD\EXE\CPRS II
 
-    .EXAMPLE
-        cprs-prod-deploy -Source 'V:\TEST\EXE\<folder>'
+        When deploying to the live CPRS II directory, the existing:
 
-        Uses the supplied TEST path directly.
+            Cprs - Shortcut.lnk
 
-    .EXAMPLE
-        cprs-prod-deploy -Folder <folder>
+        is preserved.
 
-        -Folder is an alias for -Source.
+        Production deployment performs staging, verification, archiving,
+        deployment verification, and automatic rollback when necessary.
 
-    .EXAMPLE
-        cprs-prod-deploy -WhatIf
-
-        Displays the complete production deployment plan for TEST Current
-        without making changes.
-
-    .EXAMPLE
-        cprs-prod-deploy -Source <folder> -WhatIf
-
-        Displays the production deployment plan for a specific TEST build
-        without making changes.
+        A successful deployment sends an HTML deployment notification using
+        the configured CCMAIL JOBFLAG.
     #>
 
     [CmdletBinding(
@@ -1946,24 +2526,19 @@ function global:Deploy-CprsProductionClient {
         [Parameter(Position = 0)]
         [Alias('Folder', 'SourceFolder')]
         [ValidateNotNullOrEmpty()]
-        [string]$Source = 'Current'
+        [string]$Source = 'CPRS II',
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$DestinationFolder = 'CPRS II',
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Message
     )
 
-
     # =========================================================================
-    # CPRS deployment locations
-    #
-    # TEST builds:
-    #     V:\TEST\EXE
-    #
-    # Production root:
-    #     V:\PROD\EXE
-    #
-    # Live production CPRS application:
-    #     V:\PROD\EXE\CPRS II
-    #
-    # Archived production builds:
-    #     V:\PROD\EXE\Builds
+    # Deployment locations and configuration
     # =========================================================================
 
     $testRoot =
@@ -1972,33 +2547,27 @@ function global:Deploy-CprsProductionClient {
     $productionRoot =
         'V:\PROD\EXE'
 
-    $productionDirectory =
-        Join-Path $productionRoot 'CPRS II'
-
     $productionBuildsRoot =
         Join-Path $productionRoot 'Builds'
 
+    $deploymentEmailJobFlag =
+        'DEPL'
 
-    # These are initialized now so the catch/finally blocks can safely
-    # determine what work was completed if an error occurs.
+    $shortcutName =
+        'Cprs - Shortcut.lnk'
+
+    $deploymentStart =
+        Get-Date
 
     $archiveDirectory = $null
     $stagingDirectory = $null
+
     $archiveCreated = $false
     $deploymentStarted = $false
 
 
     # =========================================================================
-    # Internal helper
-    #
-    # Returns useful statistics for a deployment directory.
-    #
-    # These statistics are used when:
-    #
-    #   - reporting the selected TEST build,
-    #   - verifying the staging copy,
-    #   - verifying the production archive,
-    #   - verifying the final production deployment.
+    # Directory summary helper
     # =========================================================================
 
     function Get-CprsDirectorySummary {
@@ -2024,12 +2593,13 @@ function global:Deploy-CprsProductionClient {
                 -ErrorAction Stop
         )
 
-        $bytes = (
-            $files |
-                Measure-Object `
-                    -Property Length `
-                    -Sum
-        ).Sum
+        $bytes =
+            (
+                $files |
+                    Measure-Object `
+                        -Property Length `
+                        -Sum
+            ).Sum
 
         if ($null -eq $bytes) {
             $bytes = 0
@@ -2048,7 +2618,7 @@ function global:Deploy-CprsProductionClient {
 
 
     # =========================================================================
-    # Validate required environment roots
+    # Validate environment roots
     # =========================================================================
 
     if (-not (
@@ -2060,7 +2630,6 @@ function global:Deploy-CprsProductionClient {
             "CPRS TEST deployment root is not available: $testRoot"
         )
     }
-
 
     if (-not (
         Test-Path `
@@ -2074,25 +2643,89 @@ function global:Deploy-CprsProductionClient {
 
 
     # =========================================================================
-    # Resolve the TEST source
-    #
-    # Supported forms:
-    #
-    #     cprs-prod-deploy
-    #
-    #         -> V:\TEST\EXE\Current
-    #
-    #     cprs-prod-deploy -Source <folder>
-    #
-    #         -> V:\TEST\EXE\<folder>
-    #
-    #     cprs-prod-deploy -Source 'V:\TEST\EXE\<folder>'
-    #
-    #         -> complete path is used directly
+    # Validate destination folder
     # =========================================================================
 
-    $Source = $Source.Trim()
+    $DestinationFolder =
+        $DestinationFolder.Trim()
 
+    if (
+        $DestinationFolder.Contains('\') -or
+        $DestinationFolder.Contains('/') -or
+        $DestinationFolder -in @('.', '..')
+    ) {
+        throw (
+            'DestinationFolder must be a folder name only. ' +
+            'Example: CR2249'
+        )
+    }
+
+    $invalidCharacters =
+        [System.IO.Path]::GetInvalidFileNameChars()
+
+    if (
+        $DestinationFolder.IndexOfAny(
+            $invalidCharacters
+        ) -ge 0
+    ) {
+        throw (
+            "Invalid production destination folder: " +
+            $DestinationFolder
+        )
+    }
+
+    if (
+        $DestinationFolder.Equals(
+            'Builds',
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    ) {
+        throw (
+            'Builds is reserved and cannot be used as a ' +
+            'production destination.'
+        )
+    }
+
+    if (
+        $DestinationFolder.StartsWith(
+            '_CPRS_STAGING_',
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    ) {
+        throw (
+            'DestinationFolder cannot use the reserved ' +
+            '_CPRS_STAGING_ prefix.'
+        )
+    }
+
+    $isLiveDestination =
+        $DestinationFolder.Equals(
+            'CPRS II',
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+
+    $productionDirectory =
+        Join-Path `
+            $productionRoot `
+            $DestinationFolder
+
+    $productionExecutable =
+        Join-Path `
+            $productionDirectory `
+            'Cprs.exe'
+
+    $productionShortcut =
+        Join-Path `
+            $productionDirectory `
+            $shortcutName
+
+
+    # =========================================================================
+    # Resolve TEST source
+    # =========================================================================
+
+    $Source =
+        $Source.Trim()
 
     if ([System.IO.Path]::IsPathRooted($Source)) {
 
@@ -2101,28 +2734,21 @@ function global:Deploy-CprsProductionClient {
     }
     else {
 
-        # A relative value must be a folder NAME only.
-        #
-        # This prevents values such as:
-        #
-        #     ..\something
-        #
-        # from being interpreted as a path.
-
         if (
             $Source.Contains('\') -or
             $Source.Contains('/')
         ) {
             throw (
-                'Specify either a TEST folder name or a complete TEST path. ' +
-                'Examples: <folder> or V:\TEST\EXE\<folder>.'
+                'Specify either a TEST folder name or a complete ' +
+                'TEST path underneath V:\TEST\EXE.'
             )
         }
 
         $sourceCandidate =
-            Join-Path $testRoot $Source
+            Join-Path `
+                $testRoot `
+                $Source
     }
-
 
     if (-not (
         Test-Path `
@@ -2130,13 +2756,10 @@ function global:Deploy-CprsProductionClient {
             -PathType Container
     )) {
         throw (
-            "CPRS TEST source directory was not found: $sourceCandidate"
+            "CPRS TEST source directory was not found: " +
+            $sourceCandidate
         )
     }
-
-
-    # Resolve both paths to their actual filesystem representations before
-    # performing the safety comparison.
 
     $resolvedTestRoot =
         (
@@ -2145,7 +2768,6 @@ function global:Deploy-CprsProductionClient {
                 -ErrorAction Stop
         ).Path.TrimEnd('\')
 
-
     $sourceDirectory =
         (
             Resolve-Path `
@@ -2153,19 +2775,11 @@ function global:Deploy-CprsProductionClient {
                 -ErrorAction Stop
         ).Path.TrimEnd('\')
 
-
-    # Production promotion is intentionally restricted to builds that reside
-    # underneath V:\TEST\EXE.
-    #
-    # This prevents someone from accidentally supplying an unrelated folder
-    # elsewhere on V: or on a local drive.
-
     $sourceIsUnderTest =
         $sourceDirectory.StartsWith(
             $resolvedTestRoot + '\',
             [System.StringComparison]::OrdinalIgnoreCase
         )
-
 
     if (-not $sourceIsUnderTest) {
         throw (
@@ -2176,12 +2790,13 @@ function global:Deploy-CprsProductionClient {
 
 
     # =========================================================================
-    # Validate selected TEST build
+    # Inspect TEST build
     # =========================================================================
 
     $sourceExecutable =
-        Join-Path $sourceDirectory 'Cprs.exe'
-
+        Join-Path `
+            $sourceDirectory `
+            'Cprs.exe'
 
     if (-not (
         Test-Path `
@@ -2194,12 +2809,10 @@ function global:Deploy-CprsProductionClient {
         )
     }
 
-
     $sourceVersion =
         [System.Diagnostics.FileVersionInfo]::GetVersionInfo(
             $sourceExecutable
         ).FileVersion
-
 
     $sourceHash =
         (
@@ -2209,11 +2822,9 @@ function global:Deploy-CprsProductionClient {
                 -ErrorAction Stop
         ).Hash
 
-
     $sourceSummary =
         Get-CprsDirectorySummary `
             -Path $sourceDirectory
-
 
     $sourceItems = @(
         Get-ChildItem `
@@ -2224,18 +2835,7 @@ function global:Deploy-CprsProductionClient {
 
 
     # =========================================================================
-    # Inspect current production application
-    #
-    # IMPORTANT:
-    #
-    # We inspect ONLY:
-    #
-    #     V:\PROD\EXE\CPRS II
-    #
-    # We do NOT treat V:\PROD\EXE itself as the live application directory.
-    #
-    # Therefore V:\PROD\EXE\Builds and any other sibling directories are not
-    # part of the production application replacement.
+    # Inspect selected production destination
     # =========================================================================
 
     $productionExists =
@@ -2243,22 +2843,14 @@ function global:Deploy-CprsProductionClient {
             -LiteralPath $productionDirectory `
             -PathType Container
 
-
-    $productionExecutable =
-        Join-Path $productionDirectory 'Cprs.exe'
-
-
     $productionVersion =
         'not found'
-
 
     $productionHash =
         $null
 
-
     $productionHashShort =
         'unknown'
-
 
     $productionSummary =
         [pscustomobject]@{
@@ -2268,9 +2860,8 @@ function global:Deploy-CprsProductionClient {
             Megabytes     = 0
         }
 
-
-    $productionItems = @()
-
+    $productionItems =
+        @()
 
     if ($productionExists) {
 
@@ -2281,11 +2872,9 @@ function global:Deploy-CprsProductionClient {
                 -ErrorAction Stop
         )
 
-
         $productionSummary =
             Get-CprsDirectorySummary `
                 -Path $productionDirectory
-
 
         if (
             Test-Path `
@@ -2298,7 +2887,6 @@ function global:Deploy-CprsProductionClient {
                     $productionExecutable
                 ).FileVersion
 
-
             $productionHash =
                 (
                     Get-FileHash `
@@ -2306,7 +2894,6 @@ function global:Deploy-CprsProductionClient {
                         -Algorithm SHA256 `
                         -ErrorAction Stop
                 ).Hash
-
 
             $productionHashShort =
                 $productionHash.
@@ -2316,25 +2903,44 @@ function global:Deploy-CprsProductionClient {
     }
 
 
-    # An archive is needed whenever the existing production application
-    # directory contains anything.
+    # =========================================================================
+    # Determine shortcut preservation
+    # =========================================================================
+
+    $shortcutExists =
+        $isLiveDestination -and
+        (
+            Test-Path `
+                -LiteralPath $productionShortcut `
+                -PathType Leaf
+        )
+
+
+    # =========================================================================
+    # Determine archive
+    # =========================================================================
 
     $archiveRequired =
         $productionExists -and
         $productionItems.Count -gt 0
 
-
-    # =========================================================================
-    # Determine production archive location
-    # =========================================================================
-
     $timestamp =
         Get-Date -Format 'yyyyMMdd-HHmmss'
 
+    if ($isLiveDestination) {
 
-    $archiveName =
-        "CPRS_v${productionVersion}_build${timestamp}_${productionHashShort}"
+        $archiveName =
+            "CPRS_v${productionVersion}_build${timestamp}_${productionHashShort}"
+    }
+    else {
 
+        $safeDestinationName =
+            $DestinationFolder -replace '[^A-Za-z0-9._-]', '_'
+
+        $archiveName =
+            "CPRS_${safeDestinationName}_v${productionVersion}_" +
+            "build${timestamp}_${productionHashShort}"
+    }
 
     $archiveDirectory =
         Join-Path `
@@ -2343,13 +2949,7 @@ function global:Deploy-CprsProductionClient {
 
 
     # =========================================================================
-    # Determine staging directory
-    #
-    # The TEST build is copied to a temporary directory on the production
-    # filesystem and verified BEFORE the live CPRS II directory is changed.
-    #
-    # The staging directory is temporary and is removed when the operation
-    # completes or is cancelled.
+    # Temporary staging directory
     # =========================================================================
 
     $stagingDirectory =
@@ -2362,9 +2962,7 @@ function global:Deploy-CprsProductionClient {
 
 
     # =========================================================================
-    # Complete pre-deployment report
-    #
-    # Nothing has been changed at this point.
+    # Deployment report
     # =========================================================================
 
     Write-Host ''
@@ -2379,17 +2977,26 @@ function global:Deploy-CprsProductionClient {
 
     Write-Host ''
 
-    Write-Host (
-        'WARNING: This operation can modify the live CPRS production ' +
-        'application.'
-    ) -ForegroundColor Yellow
+    if ($isLiveDestination) {
+
+        Write-Host (
+            'WARNING: This operation targets the LIVE CPRS production ' +
+            'application.'
+        ) -ForegroundColor Yellow
+    }
+    else {
+
+        Write-Host (
+            'SAFE PROD FOLDER MODE: Live V:\PROD\EXE\CPRS II ' +
+            'will NOT be modified.'
+        ) -ForegroundColor Green
+    }
 
     Write-Host ''
 
+    Write-Host "Deployment message : $Message"
 
-    # -------------------------------------------------------------------------
-    # Source report
-    # -------------------------------------------------------------------------
+    Write-Host ''
 
     Write-Host 'SOURCE BUILD' `
         -ForegroundColor Cyan
@@ -2407,19 +3014,16 @@ function global:Deploy-CprsProductionClient {
 
     Write-Host ''
 
-
-    # -------------------------------------------------------------------------
-    # Destination report
-    # -------------------------------------------------------------------------
-
     Write-Host 'PRODUCTION DESTINATION' `
         -ForegroundColor Cyan
 
     Write-Host ''
 
     Write-Host "  PROD root       : $productionRoot"
-    Write-Host "  Live directory  : $productionDirectory"
+    Write-Host "  Folder          : $DestinationFolder"
+    Write-Host "  Destination     : $productionDirectory"
     Write-Host "  Cprs.exe        : $productionExecutable"
+    Write-Host "  Live CPRS II    : $isLiveDestination"
     Write-Host "  Exists          : $productionExists"
     Write-Host "  Current version : $productionVersion"
     Write-Host "  Current files   : $($productionSummary.Files)"
@@ -2429,12 +3033,21 @@ function global:Deploy-CprsProductionClient {
         Write-Host "  Current SHA256  : $productionHash"
     }
 
+    if ($isLiveDestination) {
+
+        Write-Host "  Shortcut exists : $shortcutExists"
+
+        if ($shortcutExists) {
+            Write-Host '  Shortcut action : PRESERVE'
+        }
+    }
+    else {
+
+        Write-Host '  Live CPRS II    : NOT MODIFIED' `
+            -ForegroundColor Green
+    }
+
     Write-Host ''
-
-
-    # -------------------------------------------------------------------------
-    # Archive report
-    # -------------------------------------------------------------------------
 
     Write-Host 'PRODUCTION ARCHIVE' `
         -ForegroundColor Cyan
@@ -2444,23 +3057,16 @@ function global:Deploy-CprsProductionClient {
     Write-Host "  Builds root     : $productionBuildsRoot"
 
     if ($archiveRequired) {
+
         Write-Host "  Archive target  : $archiveDirectory"
         Write-Host '  Archive required: YES'
     }
     else {
+
         Write-Host '  Archive required: NO'
-        Write-Host (
-            '  Reason          : No existing production application ' +
-            'content was found.'
-        )
     }
 
     Write-Host ''
-
-
-    # -------------------------------------------------------------------------
-    # Deployment flow
-    # -------------------------------------------------------------------------
 
     Write-Host 'DEPLOYMENT FLOW' `
         -ForegroundColor Cyan
@@ -2505,6 +3111,33 @@ function global:Deploy-CprsProductionClient {
             Source      = $sourceExecutable
             Destination = $productionExecutable
         }
+
+        [pscustomobject]@{
+            Step        = 5
+            Action      = if (
+                $isLiveDestination -and
+                $shortcutExists
+            ) {
+                'RESTORE SHORTCUT'
+            }
+            else {
+                'NO SHORTCUT'
+            }
+
+            Source = if ($shortcutExists) {
+                $shortcutName
+            }
+            else {
+                '-'
+            }
+
+            Destination = if ($shortcutExists) {
+                $productionShortcut
+            }
+            else {
+                '-'
+            }
+        }
     ) |
         Format-Table `
             Step,
@@ -2516,65 +3149,8 @@ function global:Deploy-CprsProductionClient {
         Out-Host
 
 
-    # -------------------------------------------------------------------------
-    # Show exactly what the selected TEST build contains at the top level.
-    # -------------------------------------------------------------------------
-
-    Write-Host ''
-    Write-Host 'TEST BUILD TOP-LEVEL CONTENTS' `
-        -ForegroundColor Cyan
-
-    Write-Host ''
-
-
-    $sourceItems |
-        Select-Object `
-            @{
-                Name = 'Type'
-                Expression = {
-                    if ($_.PSIsContainer) {
-                        'Directory'
-                    }
-                    else {
-                        'File'
-                    }
-                }
-            },
-            Name |
-        Format-Table `
-            -AutoSize |
-        Out-Host
-
-
-    # -------------------------------------------------------------------------
-    # Warn when source and production executables appear identical.
-    # -------------------------------------------------------------------------
-
-    if (
-        $productionHash -and
-        $sourceHash -eq $productionHash
-    ) {
-
-        Write-Warning (
-            'The selected TEST Cprs.exe has the same SHA256 hash as ' +
-            'the current production Cprs.exe.'
-        )
-
-        Write-Warning (
-            'Review whether a production deployment is actually necessary.'
-        )
-    }
-
-
     # =========================================================================
     # WhatIf
-    #
-    # A WhatIf invocation stops here.
-    #
-    # No directory is created.
-    # No staging copy is performed.
-    # No production archive is created.
-    # No production files are changed.
     # =========================================================================
 
     if ($WhatIfPreference) {
@@ -2602,6 +3178,7 @@ function global:Deploy-CprsProductionClient {
         Write-Host ''
 
         if ($archiveRequired) {
+
             Write-Host "Would archive : $productionDirectory"
             Write-Host "                 -> $archiveDirectory"
             Write-Host ''
@@ -2610,14 +3187,26 @@ function global:Deploy-CprsProductionClient {
         Write-Host "Would deploy  : $sourceDirectory"
         Write-Host "                 -> $productionDirectory"
 
+        if (
+            $isLiveDestination -and
+            $shortcutExists
+        ) {
+
+            Write-Host ''
+            Write-Host "Would preserve: $productionShortcut"
+        }
+
+        if (-not $isLiveDestination) {
+
+            Write-Host ''
+            Write-Host (
+                'LIVE CPRS II WOULD NOT BE MODIFIED.'
+            ) -ForegroundColor Green
+        }
+
         Write-Host ''
-
-        Write-Host 'To perform the actual deployment, run the same command' `
+        Write-Host 'Deployment email: NOT SENT IN PREVIEW MODE' `
             -ForegroundColor Yellow
-
-        Write-Host 'without -WhatIf.' `
-            -ForegroundColor Yellow
-
         Write-Host ''
 
         return
@@ -2625,12 +3214,7 @@ function global:Deploy-CprsProductionClient {
 
 
     # =========================================================================
-    # CONFIRMATION 1 OF 2
-    #
-    # The operator must confirm that the report above has actually been
-    # reviewed.
-    #
-    # Production has NOT been changed yet.
+    # Confirmation 1
     # =========================================================================
 
     Write-Host ''
@@ -2645,71 +3229,51 @@ function global:Deploy-CprsProductionClient {
 
     Write-Host ''
 
-    Write-Host 'Review the information above carefully:'
-    Write-Host ''
-    Write-Host "  Source      : $sourceDirectory"
-    Write-Host "  Destination : $productionDirectory"
+    Write-Host "Source      : $sourceDirectory"
+    Write-Host "Destination : $productionDirectory"
+    Write-Host "Version     : $sourceVersion"
+    Write-Host "SHA256      : $sourceHash"
+    Write-Host "Message     : $Message"
 
     if ($archiveRequired) {
-        Write-Host "  Archive     : $archiveDirectory"
-    }
-    else {
-        Write-Host '  Archive     : Not required'
+        Write-Host "Archive     : $archiveDirectory"
     }
 
-    Write-Host "  Version     : $sourceVersion"
-    Write-Host "  SHA256      : $sourceHash"
+    if (-not $isLiveDestination) {
+
+        Write-Host ''
+        Write-Host (
+            'Live V:\PROD\EXE\CPRS II will NOT be modified.'
+        ) -ForegroundColor Green
+    }
 
     Write-Host ''
-
-    Write-Host (
-        'Nothing in the live production application has been modified.'
-    ) -ForegroundColor Green
-
-    Write-Host ''
-
 
     $reviewConfirmation =
-        Read-Host 'Type REVIEWED to stage and verify this build'
+        Read-Host 'Type DEPLOY to stage and verify this build'
 
-
-    if ($reviewConfirmation -cne 'REVIEWED') {
+    if ($reviewConfirmation -cne 'DEPLOY') {
 
         Write-Host ''
         Write-Host 'PRODUCTION DEPLOYMENT CANCELLED.' `
             -ForegroundColor Yellow
 
-        Write-Host 'The live CPRS production application was not modified.' `
-            -ForegroundColor Green
-
         Write-Host ''
-
         return
     }
 
 
-    # =========================================================================
-    # Stage and verify selected TEST build
-    #
-    # Staging occurs before the final production authorization.
-    #
-    # The live production directory remains untouched.
-    # =========================================================================
-
     try {
+
+        # =====================================================================
+        # Create Builds root
+        # =====================================================================
 
         if (-not (
             Test-Path `
                 -LiteralPath $productionBuildsRoot `
                 -PathType Container
         )) {
-
-            Write-Host ''
-            Write-Host (
-                "Creating production Builds directory: " +
-                $productionBuildsRoot
-            ) -ForegroundColor Cyan
-
 
             New-Item `
                 -ItemType Directory `
@@ -2719,6 +3283,10 @@ function global:Deploy-CprsProductionClient {
                 Out-Null
         }
 
+
+        # =====================================================================
+        # Stage TEST build
+        # =====================================================================
 
         Write-Host ''
         Write-Host '============================================================' `
@@ -2737,14 +3305,12 @@ function global:Deploy-CprsProductionClient {
 
         Write-Host ''
 
-
         New-Item `
             -ItemType Directory `
             -Path $stagingDirectory `
             -Force `
             -ErrorAction Stop |
             Out-Null
-
 
         foreach ($item in $sourceItems) {
 
@@ -2759,13 +3325,14 @@ function global:Deploy-CprsProductionClient {
         }
 
 
-        # ---------------------------------------------------------------------
+        # =====================================================================
         # Verify staging
-        # ---------------------------------------------------------------------
+        # =====================================================================
 
         $stagedExecutable =
-            Join-Path $stagingDirectory 'Cprs.exe'
-
+            Join-Path `
+                $stagingDirectory `
+                'Cprs.exe'
 
         if (-not (
             Test-Path `
@@ -2774,10 +3341,9 @@ function global:Deploy-CprsProductionClient {
         )) {
             throw (
                 'Staging verification failed. ' +
-                'Cprs.exe was not found in the staging directory.'
+                'Cprs.exe was not found.'
             )
         }
-
 
         $stagedHash =
             (
@@ -2787,19 +3353,16 @@ function global:Deploy-CprsProductionClient {
                     -ErrorAction Stop
             ).Hash
 
-
         $stagedSummary =
             Get-CprsDirectorySummary `
                 -Path $stagingDirectory
 
-
         if ($stagedHash -ne $sourceHash) {
             throw (
                 'Staging verification failed. ' +
-                'Cprs.exe SHA256 does not match the TEST source.'
+                'Cprs.exe SHA256 does not match TEST.'
             )
         }
-
 
         if (
             $stagedSummary.Files -ne
@@ -2807,10 +3370,9 @@ function global:Deploy-CprsProductionClient {
         ) {
             throw (
                 'Staging verification failed. ' +
-                'The staged file count does not match the TEST source.'
+                'File count does not match TEST.'
             )
         }
-
 
         if (
             $stagedSummary.Bytes -ne
@@ -2818,10 +3380,9 @@ function global:Deploy-CprsProductionClient {
         ) {
             throw (
                 'Staging verification failed. ' +
-                'The staged byte count does not match the TEST source.'
+                'Byte count does not match TEST.'
             )
         }
-
 
         Write-Host ''
         Write-Host 'STAGING VERIFICATION SUCCEEDED' `
@@ -2829,20 +3390,16 @@ function global:Deploy-CprsProductionClient {
 
         Write-Host ''
 
-        Write-Host "  Files  : $($stagedSummary.Files)"
-        Write-Host "  Size   : $($stagedSummary.Megabytes) MB"
-        Write-Host "  SHA256 : $stagedHash"
+        Write-Host "Files  : $($stagedSummary.Files)"
+        Write-Host "Size   : $($stagedSummary.Megabytes) MB"
+        Write-Host "SHA256 : $stagedHash"
+
+
+        # =====================================================================
+        # Confirmation 2
+        # =====================================================================
 
         Write-Host ''
-
-
-        # =====================================================================
-        # CONFIRMATION 2 OF 2
-        #
-        # This is the final authorization before the live production
-        # application is touched.
-        # =====================================================================
-
         Write-Host '============================================================' `
             -ForegroundColor Red
 
@@ -2854,39 +3411,29 @@ function global:Deploy-CprsProductionClient {
 
         Write-Host ''
 
-        Write-Host 'THE SELECTED TEST BUILD HAS BEEN STAGED AND VERIFIED.' `
-            -ForegroundColor Green
+        if ($isLiveDestination) {
 
-        Write-Host ''
+            Write-Host (
+                'THE NEXT STEP WILL MODIFY LIVE CPRS PRODUCTION.'
+            ) -ForegroundColor Yellow
+        }
+        else {
 
-        Write-Host 'The next step WILL modify the live production application.' `
-            -ForegroundColor Yellow
+            Write-Host (
+                "The next step will deploy to $productionDirectory."
+            ) -ForegroundColor Yellow
 
-        Write-Host ''
-
-        Write-Host "Source      : $sourceDirectory"
-        Write-Host "Destination : $productionDirectory"
-
-        if ($archiveRequired) {
-            Write-Host "Archive     : $archiveDirectory"
+            Write-Host (
+                'Live V:\PROD\EXE\CPRS II will NOT be modified.'
+            ) -ForegroundColor Green
         }
 
-        Write-Host "Version     : $sourceVersion"
-        Write-Host "SHA256      : $sourceHash"
-
         Write-Host ''
-
-        Write-Host (
-            'If you do not want to modify production, enter anything ' +
-            'other than DEPLOY PROD.'
-        ) -ForegroundColor Yellow
-
-        Write-Host ''
-
 
         $deployConfirmation =
-            Read-Host 'Type DEPLOY PROD to authorize production deployment'
-
+            Read-Host (
+                'Type DEPLOY PROD to authorize production deployment'
+            )
 
         if ($deployConfirmation -cne 'DEPLOY PROD') {
 
@@ -2894,25 +3441,15 @@ function global:Deploy-CprsProductionClient {
             Write-Host 'PRODUCTION DEPLOYMENT CANCELLED.' `
                 -ForegroundColor Yellow
 
-            Write-Host (
-                'The live CPRS production application was not modified.'
-            ) -ForegroundColor Green
-
             Write-Host ''
-
             return
         }
-
-
-        # SupportsShouldProcess gives the command standard PowerShell
-        # -Confirm support in addition to the two explicit confirmations above.
 
         if (-not (
             $PSCmdlet.ShouldProcess(
                 $productionDirectory,
                 (
-                    "Archive current CPRS production build and deploy " +
-                    "CPRS $sourceVersion"
+                    "Deploy CPRS $sourceVersion from TEST"
                 )
             )
         )) {
@@ -2921,15 +3458,7 @@ function global:Deploy-CprsProductionClient {
 
 
         # =====================================================================
-        # STEP 1
-        # Archive current V:\PROD\EXE\CPRS II
-        #
-        # The archive is stored under:
-        #
-        #     V:\PROD\EXE\Builds
-        #
-        # The live directory is NOT removed until the archive copy has been
-        # verified.
+        # Archive existing destination
         # =====================================================================
 
         if ($archiveRequired) {
@@ -2938,7 +3467,7 @@ function global:Deploy-CprsProductionClient {
             Write-Host '============================================================' `
                 -ForegroundColor Cyan
 
-            Write-Host '        STEP 1 - ARCHIVING CURRENT PRODUCTION' `
+            Write-Host '        ARCHIVING CURRENT DESTINATION' `
                 -ForegroundColor Cyan
 
             Write-Host '============================================================' `
@@ -2951,14 +3480,12 @@ function global:Deploy-CprsProductionClient {
 
             Write-Host ''
 
-
             New-Item `
                 -ItemType Directory `
                 -Path $archiveDirectory `
                 -Force `
                 -ErrorAction Stop |
                 Out-Null
-
 
             foreach ($item in $productionItems) {
 
@@ -2972,15 +3499,9 @@ function global:Deploy-CprsProductionClient {
                     -ErrorAction Stop
             }
 
-
-            # -----------------------------------------------------------------
-            # Verify archive before touching live production
-            # -----------------------------------------------------------------
-
             $archiveSummary =
                 Get-CprsDirectorySummary `
                     -Path $archiveDirectory
-
 
             if (
                 $archiveSummary.Files -ne
@@ -2988,10 +3509,9 @@ function global:Deploy-CprsProductionClient {
             ) {
                 throw (
                     'Production archive verification failed. ' +
-                    'Archived file count does not match current production.'
+                    'File count does not match.'
                 )
             }
-
 
             if (
                 $archiveSummary.Bytes -ne
@@ -2999,10 +3519,9 @@ function global:Deploy-CprsProductionClient {
             ) {
                 throw (
                     'Production archive verification failed. ' +
-                    'Archived byte count does not match current production.'
+                    'Byte count does not match.'
                 )
             }
-
 
             if ($productionHash) {
 
@@ -3010,7 +3529,6 @@ function global:Deploy-CprsProductionClient {
                     Join-Path `
                         $archiveDirectory `
                         'Cprs.exe'
-
 
                 if (-not (
                     Test-Path `
@@ -3023,7 +3541,6 @@ function global:Deploy-CprsProductionClient {
                     )
                 }
 
-
                 $archivedHash =
                     (
                         Get-FileHash `
@@ -3032,60 +3549,56 @@ function global:Deploy-CprsProductionClient {
                             -ErrorAction Stop
                     ).Hash
 
-
                 if ($archivedHash -ne $productionHash) {
                     throw (
                         'Production archive verification failed. ' +
-                        'Archived Cprs.exe does not match current production.'
+                        'Archived Cprs.exe does not match.'
                     )
                 }
             }
 
+            if (
+                $isLiveDestination -and
+                $shortcutExists
+            ) {
 
-            $archiveCreated = $true
+                $archivedShortcut =
+                    Join-Path `
+                        $archiveDirectory `
+                        $shortcutName
 
+                if (-not (
+                    Test-Path `
+                        -LiteralPath $archivedShortcut `
+                        -PathType Leaf
+                )) {
+                    throw (
+                        'Production archive verification failed. ' +
+                        'The CPRS shortcut was not archived.'
+                    )
+                }
+            }
+
+            $archiveCreated =
+                $true
 
             Write-Host ''
             Write-Host 'PRODUCTION ARCHIVE VERIFIED' `
                 -ForegroundColor Green
 
             Write-Host ''
-
-            Write-Host "  Archive : $archiveDirectory"
-            Write-Host "  Files   : $($archiveSummary.Files)"
-            Write-Host "  Size    : $($archiveSummary.Megabytes) MB"
-
-            Write-Host ''
-        }
-        else {
-
-            Write-Host ''
-            Write-Host 'STEP 1 - ARCHIVE NOT REQUIRED' `
-                -ForegroundColor Yellow
-
-            Write-Host (
-                'No existing production application content was found.'
-            )
-
-            Write-Host ''
         }
 
 
         # =====================================================================
-        # STEP 2
-        # Replace the live CPRS II application directory
-        #
-        # ONLY this directory is replaced:
-        #
-        #     V:\PROD\EXE\CPRS II
-        #
-        # Neither V:\PROD\EXE nor V:\PROD\EXE\Builds is removed.
+        # Deploy
         # =====================================================================
 
+        Write-Host ''
         Write-Host '============================================================' `
             -ForegroundColor Cyan
 
-        Write-Host '           STEP 2 - DEPLOYING TO PRODUCTION' `
+        Write-Host '           DEPLOYING TO PRODUCTION' `
             -ForegroundColor Cyan
 
         Write-Host '============================================================' `
@@ -3098,21 +3611,13 @@ function global:Deploy-CprsProductionClient {
 
         Write-Host ''
 
-
-        # From this point forward a failure requires rollback.
-
-        $deploymentStarted = $true
-
+        $deploymentStarted =
+            $true
 
         if (
             Test-Path `
                 -LiteralPath $productionDirectory
         ) {
-
-            Write-Host (
-                "Removing existing live directory: " +
-                $productionDirectory
-            )
 
             Remove-Item `
                 -LiteralPath $productionDirectory `
@@ -3121,7 +3626,6 @@ function global:Deploy-CprsProductionClient {
                 -ErrorAction Stop
         }
 
-
         New-Item `
             -ItemType Directory `
             -Path $productionDirectory `
@@ -3129,14 +3633,12 @@ function global:Deploy-CprsProductionClient {
             -ErrorAction Stop |
             Out-Null
 
-
         $stagedItems = @(
             Get-ChildItem `
                 -LiteralPath $stagingDirectory `
                 -Force `
                 -ErrorAction Stop
         )
-
 
         foreach ($item in $stagedItems) {
 
@@ -3152,22 +3654,8 @@ function global:Deploy-CprsProductionClient {
 
 
         # =====================================================================
-        # STEP 3
-        # Verify final production deployment
+        # Verify deployed TEST contents
         # =====================================================================
-
-        Write-Host ''
-        Write-Host '============================================================' `
-            -ForegroundColor Cyan
-
-        Write-Host '          STEP 3 - VERIFYING PRODUCTION' `
-            -ForegroundColor Cyan
-
-        Write-Host '============================================================' `
-            -ForegroundColor Cyan
-
-        Write-Host ''
-
 
         if (-not (
             Test-Path `
@@ -3180,7 +3668,6 @@ function global:Deploy-CprsProductionClient {
             )
         }
 
-
         $deployedHash =
             (
                 Get-FileHash `
@@ -3189,65 +3676,232 @@ function global:Deploy-CprsProductionClient {
                     -ErrorAction Stop
             ).Hash
 
-
-        $deployedSummary =
+        $deployedSourceSummary =
             Get-CprsDirectorySummary `
                 -Path $productionDirectory
-
 
         if ($deployedHash -ne $sourceHash) {
             throw (
                 'Production verification failed. ' +
-                'The deployed Cprs.exe SHA256 does not match TEST.'
+                'Deployed Cprs.exe SHA256 does not match TEST.'
             )
         }
 
-
         if (
-            $deployedSummary.Files -ne
+            $deployedSourceSummary.Files -ne
             $sourceSummary.Files
         ) {
             throw (
                 'Production verification failed. ' +
-                'The production file count does not match TEST.'
+                'Deployed file count does not match TEST.'
             )
         }
 
-
         if (
-            $deployedSummary.Bytes -ne
+            $deployedSourceSummary.Bytes -ne
             $sourceSummary.Bytes
         ) {
             throw (
                 'Production verification failed. ' +
-                'The production byte count does not match TEST.'
+                'Deployed byte count does not match TEST.'
             )
         }
-
 
         $deployedVersion =
             [System.Diagnostics.FileVersionInfo]::GetVersionInfo(
                 $productionExecutable
             ).FileVersion
 
+        if ($deployedVersion -ne $sourceVersion) {
+            throw (
+                'Production verification failed. ' +
+                "Expected version $sourceVersion but found " +
+                "$deployedVersion."
+            )
+        }
 
-        Write-Host 'PRODUCTION VERIFICATION SUCCEEDED' `
-            -ForegroundColor Green
 
-        Write-Host ''
+        # =====================================================================
+        # Preserve live CPRS shortcut
+        # =========================================================================
 
-        Write-Host "  Version : $deployedVersion"
-        Write-Host "  Files   : $($deployedSummary.Files)"
-        Write-Host "  Size    : $($deployedSummary.Megabytes) MB"
-        Write-Host "  SHA256  : $deployedHash"
+        $shortcutPreserved =
+            $false
 
-        Write-Host ''
+        if (
+            $isLiveDestination -and
+            $shortcutExists
+        ) {
+
+            if (-not $archiveCreated) {
+                throw (
+                    'Shortcut preservation requires a verified ' +
+                    'production archive.'
+                )
+            }
+
+            $archivedShortcut =
+                Join-Path `
+                    $archiveDirectory `
+                    $shortcutName
+
+            Write-Host ''
+            Write-Host 'Preserving CPRS production shortcut...' `
+                -ForegroundColor Cyan
+
+            Copy-Item `
+                -LiteralPath $archivedShortcut `
+                -Destination $productionShortcut `
+                -Force `
+                -ErrorAction Stop
+
+            if (-not (
+                Test-Path `
+                    -LiteralPath $productionShortcut `
+                    -PathType Leaf
+            )) {
+                throw (
+                    'Shortcut preservation failed. ' +
+                    "$shortcutName was not restored."
+                )
+            }
+
+            $shell =
+                New-Object `
+                    -ComObject WScript.Shell
+
+            $shortcut =
+                $shell.CreateShortcut(
+                    $productionShortcut
+                )
+
+            if (-not (
+                $shortcut.TargetPath.Equals(
+                    $productionExecutable,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            )) {
+                throw (
+                    'Shortcut verification failed. ' +
+                    "Target is: $($shortcut.TargetPath)"
+                )
+            }
+
+            $shortcutPreserved =
+                $true
+
+            Write-Host (
+                "Shortcut preserved: $productionShortcut"
+            ) -ForegroundColor Green
+        }
+
+
+        # =====================================================================
+        # Final statistics
+        # =====================================================================
+
+        $finalSummary =
+            Get-CprsDirectorySummary `
+                -Path $productionDirectory
+
+        $deploymentEnd =
+            Get-Date
+
+        $elapsed =
+            $deploymentEnd - $deploymentStart
+
+        $duration =
+            '{0:00}:{1:00}:{2:00}' -f `
+                [math]::Floor($elapsed.TotalHours),
+                $elapsed.Minutes,
+                $elapsed.Seconds
+
+        $deploymentStatistics =
+            [pscustomobject]@{
+                DeploymentRoute   = 'TEST -> PROD'
+                SourceEnvironment = 'TEST'
+
+                TargetEnvironment = if ($isLiveDestination) {
+                    'PROD'
+                }
+                else {
+                    "PROD/$DestinationFolder"
+                }
+
+                Status            = 'SUCCESS'
+                DeploymentMessage = $Message
+                Version           = $deployedVersion
+                Build             = 'Promoted verified TEST build'
+                GitBranch = $null
+                GitCommit = $null
+                FilesDeployed     = $sourceSummary.Files
+                DeploymentSizeMB  = $sourceSummary.Megabytes
+
+                Started =
+                    $deploymentStart.ToString(
+                        'MM/dd/yyyy hh:mm:ss tt'
+                    )
+
+                Completed =
+                    $deploymentEnd.ToString(
+                        'MM/dd/yyyy hh:mm:ss tt'
+                    )
+
+                Duration =
+                    $duration
+
+                Source =
+                    $sourceDirectory
+
+                Destination =
+                    $productionDirectory
+
+                ArchiveRoot =
+                    $productionBuildsRoot
+
+                ArchivedTo = if ($archiveCreated) {
+                    $archiveDirectory
+                }
+                elseif (-not $isLiveDestination) {
+                    'Not archived - custom PROD folder'
+                }
+                else {
+                    'No previous build required archiving'
+                }
+            }
+
+
+        # =====================================================================
+        # Email successful deployment
+        #
+        # Email failure does NOT fail or roll back a successful deployment.
+        # =====================================================================
+
+        try {
+
+            $deploymentEmailRecipients =
+                Get-CprsDeploymentEmailRecipients `
+                    -JobFlag $deploymentEmailJobFlag
+
+            Send-CprsDeploymentEmail `
+                -Statistics $deploymentStatistics `
+                -Recipients $deploymentEmailRecipients
+        }
+        catch {
+
+            Write-Warning (
+                'Production deployment succeeded, but the deployment email ' +
+                'could not be sent: ' +
+                $_.Exception.Message
+            )
+        }
 
 
         # =====================================================================
         # Final success report
         # =====================================================================
 
+        Write-Host ''
         Write-Host '============================================================' `
             -ForegroundColor Green
 
@@ -3259,48 +3913,55 @@ function global:Deploy-CprsProductionClient {
 
         Write-Host ''
 
-        Write-Host "Source           : $sourceDirectory"
-        Write-Host "Production root  : $productionRoot"
-        Write-Host "Live application : $productionDirectory"
-        Write-Host "Builds root      : $productionBuildsRoot"
+        Write-Host "Source             : $sourceDirectory"
+        Write-Host "Destination        : $productionDirectory"
+        Write-Host "Live CPRS II       : $isLiveDestination"
+        Write-Host "Version            : $deployedVersion"
+        Write-Host "Application files  : $($sourceSummary.Files)"
+        Write-Host "Total files        : $($finalSummary.Files)"
+        Write-Host "SHA256             : $deployedHash"
+        Write-Host "Deployment message : $Message"
 
         if ($archiveCreated) {
-            Write-Host "Archived build   : $archiveDirectory"
+            Write-Host "Archived build     : $archiveDirectory"
         }
 
-        Write-Host "Version          : $deployedVersion"
-        Write-Host "Files            : $($deployedSummary.Files)"
-        Write-Host "SHA256           : $deployedHash"
-        Write-Host "Completed        : $(Get-Date)"
+        if ($isLiveDestination) {
+            Write-Host "Shortcut preserved : $shortcutPreserved"
+        }
 
+        Write-Host "Completed          : $deploymentEnd"
         Write-Host ''
 
-
         [pscustomobject]@{
-            Application         = 'CPRS'
-            Environment         = 'PROD'
-            Source              = $sourceDirectory
-            ProductionRoot      = $productionRoot
-            Destination         = $productionDirectory
-            BuildsRoot          = $productionBuildsRoot
-            ArchivedTo          = if ($archiveCreated) {
+            Application       = 'CPRS'
+            Environment       = 'PROD'
+            Source            = $sourceDirectory
+            Destination       = $productionDirectory
+            DestinationFolder = $DestinationFolder
+            LiveDestination   = $isLiveDestination
+            Version           = $deployedVersion
+            SHA256            = $deployedHash
+            ApplicationFiles  = $sourceSummary.Files
+            TotalFiles        = $finalSummary.Files
+            ShortcutPreserved = $shortcutPreserved
+
+            ArchivedTo = if ($archiveCreated) {
                 $archiveDirectory
             }
             else {
                 $null
             }
-            Version             = $deployedVersion
-            SHA256              = $deployedHash
-            FileCount           = $deployedSummary.Files
-            DeploymentTime      = Get-Date
-            Status              = 'SUCCESS'
+
+            DeploymentMessage = $Message
+            DeploymentTime    = $deploymentEnd
+            Status            = 'SUCCESS'
         }
     }
     catch {
 
         $deploymentError =
             $_
-
 
         Write-Host ''
         Write-Host '============================================================' `
@@ -3321,25 +3982,17 @@ function global:Deploy-CprsProductionClient {
 
 
         # =====================================================================
-        # Automatic rollback
-        #
-        # Rollback is necessary only if replacement of the live CPRS II
-        # directory had already started.
+        # Rollback
         # =====================================================================
 
         if ($deploymentStarted) {
 
             Write-Warning (
-                'The live production replacement had started. ' +
+                'Destination replacement had started. ' +
                 'Automatic rollback will be attempted.'
             )
 
-            Write-Host ''
-
-
             try {
-
-                # Remove the incomplete/new production application.
 
                 if (
                     Test-Path `
@@ -3353,10 +4006,7 @@ function global:Deploy-CprsProductionClient {
                         -ErrorAction Stop
                 }
 
-
                 if ($archiveCreated) {
-
-                    # Restore the complete archived application.
 
                     New-Item `
                         -ItemType Directory `
@@ -3365,14 +4015,12 @@ function global:Deploy-CprsProductionClient {
                         -ErrorAction Stop |
                         Out-Null
 
-
                     $archivedItems = @(
                         Get-ChildItem `
                             -LiteralPath $archiveDirectory `
                             -Force `
                             -ErrorAction Stop
                     )
-
 
                     foreach ($item in $archivedItems) {
 
@@ -3386,14 +4034,9 @@ function global:Deploy-CprsProductionClient {
                             -ErrorAction Stop
                     }
 
-
-                    # Verify that the restored application matches the
-                    # production application captured before deployment.
-
                     $restoredSummary =
                         Get-CprsDirectorySummary `
                             -Path $productionDirectory
-
 
                     if (
                         $restoredSummary.Files -ne
@@ -3401,10 +4044,9 @@ function global:Deploy-CprsProductionClient {
                     ) {
                         throw (
                             'Rollback verification failed. ' +
-                            'Restored file count does not match the archive.'
+                            'Restored file count does not match.'
                         )
                     }
-
 
                     if (
                         $restoredSummary.Bytes -ne
@@ -3412,10 +4054,9 @@ function global:Deploy-CprsProductionClient {
                     ) {
                         throw (
                             'Rollback verification failed. ' +
-                            'Restored byte count does not match the archive.'
+                            'Restored byte count does not match.'
                         )
                     }
-
 
                     if ($productionHash) {
 
@@ -3423,7 +4064,6 @@ function global:Deploy-CprsProductionClient {
                             Join-Path `
                                 $productionDirectory `
                                 'Cprs.exe'
-
 
                         $restoredHash =
                             (
@@ -3433,32 +4073,24 @@ function global:Deploy-CprsProductionClient {
                                     -ErrorAction Stop
                             ).Hash
 
-
                         if ($restoredHash -ne $productionHash) {
                             throw (
                                 'Rollback verification failed. ' +
-                                'Restored Cprs.exe does not match the ' +
-                                'original production executable.'
+                                'Restored Cprs.exe does not match.'
                             )
                         }
                     }
-
 
                     Write-Host ''
                     Write-Host 'AUTOMATIC ROLLBACK SUCCEEDED' `
                         -ForegroundColor Yellow
 
                     Write-Host ''
-
                     Write-Host "Restored from : $archiveDirectory"
                     Write-Host "Restored to   : $productionDirectory"
-
                     Write-Host ''
                 }
                 elseif ($productionExists) {
-
-                    # The previous production directory existed but was empty.
-                    # Restore that original empty directory.
 
                     New-Item `
                         -ItemType Directory `
@@ -3466,21 +4098,12 @@ function global:Deploy-CprsProductionClient {
                         -Force `
                         -ErrorAction Stop |
                         Out-Null
-
-
-                    Write-Host (
-                        'The original empty production directory was restored.'
-                    ) -ForegroundColor Yellow
                 }
                 else {
 
-                    # Production did not exist before the deployment, so after
-                    # removing the failed deployment there is nothing else to
-                    # restore.
-
                     Write-Host (
-                        'No previous production application existed. ' +
-                        'The failed deployment directory was removed.'
+                        'Failed new destination was removed. ' +
+                        'No previous folder required restoration.'
                     ) -ForegroundColor Yellow
                 }
             }
@@ -3490,9 +4113,8 @@ function global:Deploy-CprsProductionClient {
                 Write-Host 'AUTOMATIC ROLLBACK FAILED' `
                     -ForegroundColor Red
 
-                Write-Host ''
-
                 if ($archiveCreated) {
+
                     Write-Host (
                         'Manual recovery archive: ' +
                         $archiveDirectory
@@ -3505,21 +4127,20 @@ function global:Deploy-CprsProductionClient {
             }
         }
 
-
         throw $deploymentError
     }
     finally {
 
         # =====================================================================
-        # Always remove temporary staging data.
-        #
-        # This does NOT remove permanent archives.
+        # Always remove temporary staging directory
         # =====================================================================
 
         if (
             $stagingDirectory -and
-            (Test-Path `
-                -LiteralPath $stagingDirectory)
+            (
+                Test-Path `
+                    -LiteralPath $stagingDirectory
+            )
         ) {
 
             Remove-Item `
@@ -6237,7 +6858,7 @@ function global:Get-ProfileAliasDefinition {
 
         [pscustomobject]@{
             Category    = 'ProfileDev'
-            Alias       = 'predproj'
+            Alias       = 'epred'
             Command     = 'Open-ProfileAliasPredictorProject'
             Description = 'Open the ProfileAliasPredictor project in VS Code'
         }
@@ -6607,7 +7228,7 @@ function global:Show-ProfileHelp {
 
         Write-Host 'ProfileAliasPredictor .NET project' -ForegroundColor Cyan
         Write-Host '  1. predcd       Go to the ProfileAliasPredictor project'
-        Write-Host '  2. predproj     Open the project in Visual Studio Code'
+        Write-Host '  2. epred     Open the project in Visual Studio Code'
         Write-Host '  3. Edit and save ProfileAliasPredictor.cs'
         Write-Host '  4. predrebuild  Close PowerShell and rebuild the predictor'
         Write-Host '  5. Open a new PowerShell 7 window'
@@ -6721,23 +7342,23 @@ function global:Show-ProfileHelp {
     
         Write-Host '  cprs-test-deploy' -ForegroundColor Cyan
         Write-Host '      Build CPRS.'
-        Write-Host '      Archive the existing V:\TEST\EXE\Current build.'
-        Write-Host '      Replace V:\TEST\EXE\Current with the new build.'
+        Write-Host '      Archive the existing V:\TEST\EXE\CPRS II build.'
+        Write-Host '      Replace V:\TEST\EXE\CPRS II with the new build.'
         Write-Host ''
     
         Write-Host '  cprs-test-deploy -SkipBuild' -ForegroundColor Cyan
         Write-Host '      Do NOT build CPRS.'
         Write-Host '      Use the existing local Release build.'
-        Write-Host '      Archive the existing Current build.'
-        Write-Host '      Replace V:\TEST\EXE\Current.'
+        Write-Host '      Archive the existing CPRS II build.'
+        Write-Host '      Replace V:\TEST\EXE\CPRS II.'
         Write-Host ''
     
         Write-Host '  cprs-test-deploy -Folder <folder>' -ForegroundColor Cyan
         Write-Host '      Build CPRS.'
         Write-Host '      Deploy to V:\TEST\EXE\<folder>.'
         Write-Host '      Replace the folder if it already exists.'
-        Write-Host '      Do NOT touch Current.'
-        Write-Host '      Do NOT create a Current archive.'
+        Write-Host '      Do NOT touch CPRS II.'
+        Write-Host '      Do NOT create a CPRS II archive.'
         Write-Host ''
         Write-Host '      Example:'
         Write-Host '        cprs-test-deploy -Folder <folder>'
@@ -6747,13 +7368,13 @@ function global:Show-ProfileHelp {
         Write-Host '      Do NOT build CPRS.'
         Write-Host '      Use the existing local Release build.'
         Write-Host '      Replace V:\TEST\EXE\<folder>.'
-        Write-Host '      Do NOT touch Current or Builds.'
+        Write-Host '      Do NOT touch CPRS II or Builds.'
         Write-Host ''
     
         Write-Host 'PREVIEW OPTIONS' -ForegroundColor Cyan
         Write-Host ''
         Write-Host '  cprs-test-deploy -WhatIf'
-        Write-Host '      Preview deployment to Current.'
+        Write-Host '      Preview deployment to CPRS II.'
         Write-Host '      Does not build, archive, delete, or copy anything.'
         Write-Host ''
     
@@ -6776,8 +7397,8 @@ function global:Show-ProfileHelp {
         Write-Host 'CPRS TEST DEPLOYMENT PARAMETERS' -ForegroundColor Cyan
         Write-Host ''
         Write-Host '  -Folder <folder>'
-        Write-Host '      Deploy to V:\TEST\EXE\<folder> instead of Current.'
-        Write-Host '      Current and Builds are never modified.'
+        Write-Host '      Deploy to V:\TEST\EXE\<folder> instead of CPRS II.'
+        Write-Host '      CPRS II and Builds are never modified.'
         Write-Host ''
         Write-Host '  -SkipBuild'
         Write-Host '      Skip MSBuild and use the existing Release build.'
@@ -6793,7 +7414,7 @@ function global:Show-ProfileHelp {
         Write-Host '  Default promotion:' -ForegroundColor Cyan
         Write-Host '    cprs-prod-deploy'
         Write-Host ''
-        Write-Host '      Source      : V:\TEST\EXE\Current'
+        Write-Host '      Source      : V:\TEST\EXE\CPRS II'
         Write-Host '      Destination : V:\PROD\EXE\CPRS II'
         Write-Host '      Archive     : V:\PROD\EXE\Builds'
         Write-Host '      Archives the current V:\PROD\EXE\CPRS II before replacement.'
@@ -6825,7 +7446,7 @@ function global:Show-ProfileHelp {
         Write-Host '  Preview default promotion:' -ForegroundColor Cyan
         Write-Host '    cprs-prod-deploy -WhatIf'
         Write-Host ''
-        Write-Host '      Preview V:\TEST\EXE\Current -> V:\PROD\EXE\CPRS II.'
+        Write-Host '      Preview V:\TEST\EXE\CPRS II -> V:\PROD\EXE\CPRS II.'
         Write-Host '      No PROD files are modified.'
         Write-Host ''
 
@@ -6841,7 +7462,7 @@ function global:Show-ProfileHelp {
         Write-Host '  1. Source must be underneath V:\TEST\EXE.'
         Write-Host '  2. Cprs.exe must exist in the selected TEST build.'
         Write-Host '  3. Source version, SHA256, size, and file count are displayed.'
-        Write-Host '  4. Current PROD contents are archived to V:\PROD\EXE\Builds.'
+        Write-Host '  4. CPRS II PROD contents are archived to V:\PROD\EXE\Builds.'
         Write-Host '  5. Only V:\PROD\EXE\CPRS II is replaced; sibling folders are untouched.'
         Write-Host '  6. Operator must type REVIEWED before staging.'
         Write-Host '  7. TEST build is staged and SHA256 verified.'
@@ -6866,7 +7487,7 @@ function global:Show-ProfileHelp {
     
         Write-Host 'ARCHIVE FORMAT' -ForegroundColor Cyan
         Write-Host ''
-        Write-Host '  Normal Current deployments archive the previous build under:'
+        Write-Host '  Normal CPRS II deployments archive the previous build under:'
         Write-Host ''
         Write-Host '    V:\TEST\EXE\Builds'
         Write-Host ''
@@ -7015,7 +7636,8 @@ function global:Register-ProfileAlias {
         'cprsbuild',
         'cprstestdeploy',
         'cprsproddeploy',
-        'cprsdeploy'
+        'cprsdeploy',
+        'predproj'
     )
 
     foreach ($aliasName in $deprecatedCprsAliases) {
