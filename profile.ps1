@@ -18,8 +18,130 @@
 #>
 
 # =============================================================================
+# Profile feature settings
+# =============================================================================
+
+# Automatically run "git pull --ff-only" when entering a Git repository.
+# Change to $false if auto-pull should be disabled by default.
+$global:ProfileGitAutoPullEnabled = $true
+
+# Tracks the repository already visited so moving between folders inside the
+# same repository does not repeatedly pull.
+$global:ProfileGitAutoPullLastRoot = $null
+
+# =============================================================================
 # Internal helpers
 # =============================================================================
+function global:Invoke-GitAutoPull {
+    <#
+    .SYNOPSIS
+        Pulls the current Git repository when auto-pull is enabled.
+
+    .DESCRIPTION
+        Detects whether the current directory is inside a Git repository.
+
+        When entering a different repository, runs:
+
+            git pull --ff-only
+
+        Moving between subdirectories of the same repository does not trigger
+        another pull.
+
+        Leaving a repository resets the tracked repository so entering it again
+        later triggers another pull.
+    #>
+
+    [CmdletBinding()]
+    param()
+
+    if (-not $global:ProfileGitAutoPullEnabled) {
+        return
+    }
+
+    if ($null -eq (
+        Get-Command git -ErrorAction SilentlyContinue
+    )) {
+        return
+    }
+
+    $gitRoot = & git rev-parse --show-toplevel 2>$null
+
+    if (
+        $LASTEXITCODE -ne 0 -or
+        [string]::IsNullOrWhiteSpace($gitRoot)
+    ) {
+        $global:ProfileGitAutoPullLastRoot = $null
+        return
+    }
+
+    $gitRoot = ([string]$gitRoot).Trim()
+
+    if (
+        $global:ProfileGitAutoPullLastRoot -and
+        $global:ProfileGitAutoPullLastRoot.Equals(
+            $gitRoot,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    ) {
+        return
+    }
+
+    $global:ProfileGitAutoPullLastRoot = $gitRoot
+
+    Write-Host ''
+    Write-Host 'GIT AUTO-PULL' -ForegroundColor Cyan
+    Write-Host '=============' -ForegroundColor Cyan
+    Write-Host "Repository: $gitRoot"
+    Write-Host ''
+
+    & git -C $gitRoot pull --ff-only
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning (
+            "Git auto-pull did not complete successfully for: $gitRoot"
+        )
+    }
+}
+
+function global:Set-LocationAndGitPull {
+    <#
+    .SYNOPSIS
+        Changes directory and automatically pulls a newly entered Git repository.
+
+    .DESCRIPTION
+        Changes to the requested directory and then checks whether the new
+        location is inside a Git repository.
+
+        If Git auto-pull is enabled and this is a different repository from
+        the last one visited, runs:
+
+            git pull --ff-only
+
+    .PARAMETER Path
+        Directory to enter.
+
+    .EXAMPLE
+        cd C:\Development-CPRS\cprs-sasprogs
+
+    .EXAMPLE
+        cd ..
+
+    .EXAMPLE
+        cd .\ce
+    #>
+
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0)]
+        [string]$Path = '.'
+    )
+
+    Microsoft.PowerShell.Management\Set-Location `
+        -Path $Path
+
+    Invoke-GitAutoPull
+}
+
 
 function global:Set-ProfileLocation {
     <#
@@ -42,7 +164,10 @@ function global:Set-ProfileLocation {
         return
     }
 
-    Set-Location -LiteralPath $Path
+    Microsoft.PowerShell.Management\Set-Location `
+        -LiteralPath $Path
+
+    Invoke-GitAutoPull
 }
 
 
@@ -1036,6 +1161,77 @@ function global:Get-GitChangedFile {
     }
 
     & git status --short
+}
+
+function global:Enable-GitAutoPull {
+    <#
+    .SYNOPSIS
+        Enables automatic Git pull when entering repositories.
+
+    .EXAMPLE
+        gitpullon
+    #>
+
+    [CmdletBinding()]
+    param()
+
+    Set-Variable `
+        -Name ProfileGitAutoPullEnabled `
+        -Value $true `
+        -Scope Global
+
+    Set-Variable `
+        -Name ProfileGitAutoPullLastRoot `
+        -Value $null `
+        -Scope Global
+
+    Write-Host 'Git auto-pull enabled.' -ForegroundColor Green
+}
+
+
+function global:Disable-GitAutoPull {
+    <#
+    .SYNOPSIS
+        Disables automatic Git pull when entering repositories.
+
+    .EXAMPLE
+        gitpulloff
+    #>
+
+    [CmdletBinding()]
+    param()
+
+    Set-Variable `
+        -Name ProfileGitAutoPullEnabled `
+        -Value $false `
+        -Scope Global
+
+    Set-Variable `
+        -Name ProfileGitAutoPullLastRoot `
+        -Value $null `
+        -Scope Global
+
+    Write-Host 'Git auto-pull disabled.' -ForegroundColor Yellow
+}
+
+
+function global:Get-GitAutoPullStatus {
+    <#
+    .SYNOPSIS
+        Displays the current Git auto-pull configuration.
+
+    .EXAMPLE
+        gitpullstate
+    #>
+
+    [CmdletBinding()]
+    param()
+
+    [pscustomobject]@{
+        Enabled        = $global:ProfileGitAutoPullEnabled
+        LastRepository = $global:ProfileGitAutoPullLastRoot
+        PullCommand    = 'git pull --ff-only'
+    }
 }
 
 # =============================================================================
@@ -5433,7 +5629,7 @@ function global:Set-ParentLocation {
     [CmdletBinding()]
     param()
 
-    Set-Location ..
+    Set-LocationAndGitPull ..
 }
 
 
@@ -5449,7 +5645,7 @@ function global:Set-GrandparentLocation {
     [CmdletBinding()]
     param()
 
-    Set-Location ..\..
+    Set-LocationAndGitPull ..\..
 }
 
 function global:Set-HomeLocation {
@@ -5464,7 +5660,7 @@ function global:Set-HomeLocation {
     [CmdletBinding()]
     param()
 
-    Set-Location -LiteralPath $HOME
+    Set-LocationAndGitPull -Path $HOME
 }
 
 
@@ -5567,7 +5763,7 @@ function global:Set-GitRepositoryRoot {
         return
     }
 
-    Set-Location -LiteralPath $repositoryRoot
+    Set-LocationAndGitPull -Path $repositoryRoot
 }
 
 function global:Get-LongTimeListing {
@@ -5756,7 +5952,7 @@ function global:Get-ProfileAliasDefinition {
             Category    = 'Profile'
             Alias       = 'eprof'
             Command     = 'Edit-Profile'
-            Description = 'Open the profile in VS Code'
+            Description = 'Open the PowerShell development workspace in Visual Studio Code'
         }
         [pscustomobject]@{
             Category    = 'Profile'
@@ -6084,6 +6280,30 @@ function global:Get-ProfileAliasDefinition {
             Command     = 'Get-GitChangedFile'
             Description = 'Show staged, unstaged, and untracked files'
         }
+        [pscustomobject]@{
+            Category    = 'Git'
+            Alias       = 'gitpullon'
+            Command     = 'Enable-GitAutoPull'
+            Description = 'Enable automatic git pull when entering repositories'
+        }    
+        [pscustomobject]@{
+            Category    = 'Git'
+            Alias       = 'gitpulloff'
+            Command     = 'Disable-GitAutoPull'
+            Description = 'Disable automatic git pull when entering repositories'
+        }        
+        [pscustomobject]@{
+            Category    = 'Git'
+            Alias       = 'gitpullstate'
+            Command     = 'Get-GitAutoPullStatus'
+            Description = 'Display Git auto-pull status'
+        }        
+        [pscustomobject]@{
+            Category    = 'Git'
+            Alias       = 'cd'
+            Command     = 'Set-LocationAndGitPull'
+            Description = 'Change directory and automatically pull a newly entered Git repository'
+        }
     )
 }
 
@@ -6379,7 +6599,7 @@ function global:Show-ProfileHelp {
 
         Write-Host 'PowerShell profile.ps1' -ForegroundColor Cyan
         Write-Host '  1. pdir        Go to the PowerShell profile directory'
-        Write-Host '  2. eprof       Open profile.ps1 in Visual Studio Code'
+        Write-Host '  2. eprof       Open the PowerShell development workspace in Visual Studio Code'
         Write-Host '  3. Edit and save profile.ps1'
         Write-Host '  4. rprof       Reload the profile'
         Write-Host '  5. Test the changed aliases or functions'
@@ -6810,12 +7030,23 @@ function global:Register-ProfileAlias {
             continue
         }
 
-        Set-Alias `
-            -Name $definition.Alias `
-            -Value $definition.Command `
-            -Description $definition.Description `
-            -Scope Global `
-            -Force
+        if ($definition.Alias -eq 'cd') {
+            Set-Alias `
+                -Name $definition.Alias `
+                -Value $definition.Command `
+                -Description $definition.Description `
+                -Option AllScope `
+                -Scope Global `
+                -Force
+        }
+        else {
+            Set-Alias `
+                -Name $definition.Alias `
+                -Value $definition.Command `
+                -Description $definition.Description `
+                -Scope Global `
+                -Force
+        }
     }
 }
 
