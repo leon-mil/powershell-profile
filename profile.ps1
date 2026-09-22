@@ -3133,7 +3133,7 @@ function global:Deploy-CprsProductionClient {
     $productionSqlServer = 'SSQLL,5026'
     $productionSqlDatabase = 'cprsprod'
 
-    $deploymentEmailJobFlag = 'LOG'
+    $deploymentEmailJobFlag = 'DEPL'
     $shortcutName = 'Cprs - Shortcut.lnk'
 
     $deploymentStart = Get-Date
