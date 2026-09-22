@@ -21,13 +21,25 @@
 # Profile feature settings
 # =============================================================================
 
-# Automatically run "git pull --ff-only" when entering a Git repository.
-# Change to $false if auto-pull should be disabled by default.
+# Automatically refresh remote refs and fast-forward the current tracking branch
+# when entering a Git repository. Change to $false to disable this behavior.
 $global:ProfileGitAutoPullEnabled = $true
 
-# Tracks the repository already visited so moving between folders inside the
-# same repository does not repeatedly pull.
+# Tracks the repository already synchronized so moving between folders inside
+# the same repository does not repeatedly fetch/pull.
 $global:ProfileGitAutoPullLastRoot = $null
+
+# =============================================================================
+# Profile paths
+# =============================================================================
+
+$global:PowerShellProfileRoot =
+    Split-Path -Path $PROFILE.CurrentUserAllHosts -Parent
+
+$global:ProfileAliasPredictorRoot =
+    Join-Path `
+        $global:PowerShellProfileRoot `
+        'Projects\ProfileAliasPredictor'
 
 # =============================================================================
 # Internal helpers
@@ -35,20 +47,30 @@ $global:ProfileGitAutoPullLastRoot = $null
 function global:Invoke-GitAutoPull {
     <#
     .SYNOPSIS
-        Pulls the current Git repository when auto-pull is enabled.
+        Synchronizes the current Git repository when auto-pull is enabled.
 
     .DESCRIPTION
         Detects whether the current directory is inside a Git repository.
 
-        When entering a different repository, runs:
+        When entering a different repository, refreshes all branch heads from
+        every configured remote using an explicit wildcard refspec, then runs:
 
             git pull --ff-only
 
+        The explicit wildcard fetch keeps every remote-tracking branch current
+        even when a clone has a restricted remote.<name>.fetch configuration.
+        Stale remote-tracking refs are pruned before the current tracking branch
+        is updated.
+
         Moving between subdirectories of the same repository does not trigger
-        another pull.
+        another synchronization.
 
         Leaving a repository resets the tracked repository so entering it again
-        later triggers another pull.
+        later triggers another synchronization.
+
+        A repository is marked as synchronized only after the Git operations
+        complete successfully. If synchronization fails, the repository remains
+        eligible for another automatic attempt.
     #>
 
     [CmdletBinding()]
@@ -86,36 +108,165 @@ function global:Invoke-GitAutoPull {
         return
     }
 
-    $global:ProfileGitAutoPullLastRoot = $gitRoot
-
     Write-Host ''
-    Write-Host 'GIT AUTO-PULL' -ForegroundColor Cyan
+    Write-Host 'GIT AUTO-SYNC' -ForegroundColor Cyan
     Write-Host '=============' -ForegroundColor Cyan
     Write-Host "Repository: $gitRoot"
+
+    $gitBranch = & git -C $gitRoot branch --show-current 2>$null
+
+    if ($LASTEXITCODE -eq 0 -and $gitBranch) {
+        $gitBranch = ([string]$gitBranch).Trim()
+        Write-Host "Branch    : $gitBranch"
+    }
+    else {
+        $gitBranch = $null
+        Write-Host 'Branch    : DETACHED HEAD' -ForegroundColor Yellow
+    }
+
     Write-Host ''
+
+    # Capture existing remote-tracking branches so newly discovered branches can
+    # be reported after the fetch.
+    $remoteBranchesBefore = @(
+        & git -C $gitRoot `
+            for-each-ref `
+            '--format=%(refname:short)' `
+            refs/remotes/ 2>$null
+    )
+
+    $gitRemotes = @(
+        & git -C $gitRoot remote 2>$null
+    )
+
+    if ($LASTEXITCODE -ne 0) {
+        $global:ProfileGitAutoPullLastRoot = $null
+        Write-Warning "Unable to enumerate Git remotes for: $gitRoot"
+        return
+    }
+
+    if ($gitRemotes.Count -eq 0) {
+        $global:ProfileGitAutoPullLastRoot = $gitRoot
+        Write-Warning (
+            'No Git remotes are configured. Nothing can be fetched or pulled.'
+        )
+        return
+    }
+
+    Write-Host 'Fetching all remote branch heads...' -ForegroundColor Cyan
+
+    foreach ($gitRemote in $gitRemotes) {
+        $gitRemote = ([string]$gitRemote).Trim()
+
+        if ([string]::IsNullOrWhiteSpace($gitRemote)) {
+            continue
+        }
+
+        $fetchRefSpec =
+            "+refs/heads/*:refs/remotes/$gitRemote/*"
+
+        Write-Host "  $gitRemote"
+
+        & git -C $gitRoot `
+            fetch `
+            --prune `
+            $gitRemote `
+            $fetchRefSpec
+
+        if ($LASTEXITCODE -ne 0) {
+            $global:ProfileGitAutoPullLastRoot = $null
+            Write-Warning (
+                "Git auto-sync fetch did not complete successfully for " +
+                "remote '$gitRemote' in: $gitRoot"
+            )
+            return
+        }
+    }
+
+    $remoteBranchesAfter = @(
+        & git -C $gitRoot `
+            for-each-ref `
+            '--format=%(refname:short)' `
+            refs/remotes/ 2>$null
+    )
+
+    $newRemoteBranches = @(
+        $remoteBranchesAfter |
+            Where-Object { $_ -notin $remoteBranchesBefore }
+    )
+
+    if ($newRemoteBranches.Count -gt 0) {
+        Write-Host ''
+        Write-Host 'New remote branch(es) discovered:' -ForegroundColor Green
+
+        foreach ($remoteBranch in $newRemoteBranches) {
+            Write-Host "  $remoteBranch"
+        }
+    }
+
+    if (-not $gitBranch) {
+        $global:ProfileGitAutoPullLastRoot = $gitRoot
+        Write-Warning (
+            'Remote refs were refreshed, but the working tree is in detached ' +
+            'HEAD state, so no branch pull was performed.'
+        )
+        return
+    }
+
+    $upstream = & git -C $gitRoot `
+        rev-parse `
+        --abbrev-ref `
+        --symbolic-full-name `
+        '@{u}' 2>$null
+
+    if (
+        $LASTEXITCODE -ne 0 -or
+        [string]::IsNullOrWhiteSpace($upstream)
+    ) {
+        $global:ProfileGitAutoPullLastRoot = $gitRoot
+        Write-Warning (
+            "Remote refs were refreshed, but branch '$gitBranch' has no " +
+            'upstream tracking branch, so no pull was performed.'
+        )
+        return
+    }
+
+    $upstream = ([string]$upstream).Trim()
+
+    Write-Host "Upstream  : $upstream"
+    Write-Host ''
+    Write-Host 'Fast-forwarding current branch...' -ForegroundColor Cyan
 
     & git -C $gitRoot pull --ff-only
 
     if ($LASTEXITCODE -ne 0) {
+        $global:ProfileGitAutoPullLastRoot = $null
         Write-Warning (
-            "Git auto-pull did not complete successfully for: $gitRoot"
+            "Git auto-sync pull did not complete successfully for: $gitRoot"
         )
+        return
     }
+
+    # Mark the repository only after fetch and pull both succeed. This prevents
+    # a failed synchronization from suppressing the next automatic retry.
+    $global:ProfileGitAutoPullLastRoot = $gitRoot
+
+    Write-Host ''
+    Write-Host 'Git auto-sync completed successfully.' -ForegroundColor Green
 }
 
 function global:Set-LocationAndGitPull {
     <#
     .SYNOPSIS
-        Changes directory and automatically pulls a newly entered Git repository.
+        Changes directory and automatically synchronizes a newly entered Git repository.
 
     .DESCRIPTION
         Changes to the requested directory and then checks whether the new
         location is inside a Git repository.
 
-        If Git auto-pull is enabled and this is a different repository from
-        the last one visited, runs:
-
-            git pull --ff-only
+        If Git auto-sync is enabled and this is a different repository from
+        the last one synchronized, refreshes all remote branch heads and then
+        fast-forwards the current tracking branch.
 
     .PARAMETER Path
         Directory to enter.
@@ -350,9 +501,7 @@ function global:Set-PowerShellProfileDirectory {
     [CmdletBinding()]
     param()
 
-    Set-ProfileLocation -Path (
-        Join-Path $HOME 'Documents\PowerShell'
-    )
+    Set-ProfileLocation -Path $global:PowerShellProfileRoot
 }
 
 function global:Set-ProfileAliasPredictorDirectory {
@@ -371,11 +520,7 @@ function global:Set-ProfileAliasPredictorDirectory {
     [CmdletBinding()]
     param()
 
-    Set-ProfileLocation -Path (
-        Join-Path `
-            $HOME `
-            'Documents\PowerShell\Projects\ProfileAliasPredictor'
-    )
+    Set-ProfileLocation -Path $global:ProfileAliasPredictorRoot
 }
 
 function global:Open-ProfileAliasPredictorCommandPrompt {
@@ -395,9 +540,7 @@ function global:Open-ProfileAliasPredictorCommandPrompt {
     [CmdletBinding()]
     param()
 
-    $projectPath = Join-Path `
-        $HOME `
-        'Documents\PowerShell\Projects\ProfileAliasPredictor'
+    $projectPath = $global:ProfileAliasPredictorRoot
 
     if (-not (Test-Path -LiteralPath $projectPath -PathType Container)) {
         Write-Warning "ProfileAliasPredictor project is not available: $projectPath"
@@ -429,9 +572,7 @@ function global:Build-ProfileAliasPredictor {
     [CmdletBinding()]
     param()
 
-    $projectPath = Join-Path `
-        $HOME `
-        'Documents\PowerShell\Projects\ProfileAliasPredictor'
+    $projectPath = $global:ProfileAliasPredictorRoot
 
     $projectFile = Join-Path `
         $projectPath `
@@ -552,9 +693,7 @@ function global:Invoke-ProfileAliasPredictorRebuild {
         [switch]$Force
     )
 
-    $projectPath = Join-Path `
-        $HOME `
-        'Documents\PowerShell\Projects\ProfileAliasPredictor'
+    $projectPath = $global:ProfileAliasPredictorRoot
 
     $projectFile = Join-Path `
         $projectPath `
@@ -661,9 +800,7 @@ function global:Get-ProfileAliasPredictorInfo {
     [CmdletBinding()]
     param()
 
-    $projectPath = Join-Path `
-        $HOME `
-        'Documents\PowerShell\Projects\ProfileAliasPredictor'
+    $projectPath = $global:ProfileAliasPredictorRoot
 
     $sourceFile = Join-Path `
         $projectPath `
@@ -674,7 +811,7 @@ function global:Get-ProfileAliasPredictorInfo {
         'ProfileAliasPredictor.csproj'
 
     $dllPath = Join-Path `
-        $projectPath `
+        $global:ProfileAliasPredictorRoot `
         'bin\Release\net10.0\ProfileAliasPredictor.dll'
 
     $dllItem = Get-Item `
@@ -712,8 +849,8 @@ function global:Test-ProfileAliasPredictor {
     param()
 
     $dllPath = Join-Path `
-        $HOME `
-        'Documents\PowerShell\Projects\ProfileAliasPredictor\bin\Release\net10.0\ProfileAliasPredictor.dll'
+        $global:ProfileAliasPredictorRoot `
+        'bin\Release\net10.0\ProfileAliasPredictor.dll'
 
     $dllExists = Test-Path `
         -LiteralPath $dllPath `
@@ -997,9 +1134,7 @@ function global:Open-ProfileAliasPredictorProject {
     [CmdletBinding()]
     param()
 
-    $projectPath = Join-Path `
-        $HOME `
-        'Documents\PowerShell\Projects\ProfileAliasPredictor'
+    $projectPath = $global:ProfileAliasPredictorRoot
 
     if (-not (Test-Path -LiteralPath $projectPath -PathType Container)) {
         Write-Warning "ProfileAliasPredictor project is not available: $projectPath"
@@ -1163,10 +1298,429 @@ function global:Get-GitChangedFile {
     & git status --short
 }
 
+function global:Compare-GitBranch {
+    <#
+    .SYNOPSIS
+        Compares two Git branches and displays change statistics.
+
+    .DESCRIPTION
+        Refreshes Git remote references, compares the supplied base and feature
+        branches, displays a summary of commits and changed files, and then
+        opens each changed file through the configured Git difftool.
+
+        The comparison uses Git's three-dot syntax:
+
+            <base>...<compare>
+
+        This shows changes introduced on the compare branch since its common
+        ancestor with the base branch.
+
+    .PARAMETER Base
+        Base branch or Git reference.
+
+        Example:
+
+            origin/master
+
+    .PARAMETER Compare
+        Branch or Git reference containing the changes to review.
+
+        Example:
+
+            origin/feature/formlist
+
+    .PARAMETER NoDiff
+        Displays the comparison statistics without opening VS Code diffs.
+
+    .PARAMETER SkipFetch
+        Skips the automatic git fetch --all --prune operation.
+
+    .EXAMPLE
+        gcompare origin/master origin/feature/formlist
+
+    .EXAMPLE
+        gcompare origin/master origin/feature/formlist -NoDiff
+
+    .EXAMPLE
+        gcompare origin/master origin/feature/formlist -SkipFetch
+    #>
+
+    [CmdletBinding()]
+    param(
+        [Parameter(
+            Mandatory,
+            Position = 0
+        )]
+        [ValidateNotNullOrEmpty()]
+        [string]$Base,
+
+        [Parameter(
+            Mandatory,
+            Position = 1
+        )]
+        [ValidateNotNullOrEmpty()]
+        [string]$Compare,
+
+        [switch]$NoDiff,
+
+        [switch]$SkipFetch
+    )
+
+    # -------------------------------------------------------------------------
+    # Validate Git
+    # -------------------------------------------------------------------------
+
+    if ($null -eq (
+        Get-Command git -ErrorAction SilentlyContinue
+    )) {
+        throw 'Git is not installed or is not available in PATH.'
+    }
+
+    if (-not (Test-GitRepository)) {
+        throw 'The current directory is not inside a Git repository.'
+    }
+
+    $repositoryRoot =
+        & git rev-parse --show-toplevel 2>$null
+
+    if (
+        $LASTEXITCODE -ne 0 -or
+        [string]::IsNullOrWhiteSpace($repositoryRoot)
+    ) {
+        throw 'Unable to determine the Git repository root.'
+    }
+
+    $repositoryRoot =
+        ([string]$repositoryRoot).Trim()
+
+
+    # -------------------------------------------------------------------------
+    # Refresh remote references
+    # -------------------------------------------------------------------------
+
+    if (-not $SkipFetch) {
+
+        Write-Host ''
+        Write-Host 'Refreshing Git remote references...' `
+            -ForegroundColor Cyan
+
+        & git -C $repositoryRoot fetch --all --prune
+
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Git fetch did not complete successfully.'
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # Resolve default base branch
+    # -------------------------------------------------------------------------
+
+    if ($Base -eq 'default') {
+
+        $defaultBranch =
+            & git -C $repositoryRoot `
+                symbolic-ref `
+                --quiet `
+                --short `
+                refs/remotes/origin/HEAD 2>$null
+
+        if (
+            $LASTEXITCODE -ne 0 -or
+            [string]::IsNullOrWhiteSpace($defaultBranch)
+        ) {
+            throw (
+                'Unable to determine the default branch from origin/HEAD.'
+            )
+        }
+
+        $Base =
+            ([string]$defaultBranch).Trim()
+
+        Write-Host "Default base branch: $Base" `
+            -ForegroundColor Green
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Validate references
+    # -------------------------------------------------------------------------
+
+    foreach ($reference in @(
+        $Base,
+        $Compare
+    )) {
+
+        & git -C $repositoryRoot `
+            rev-parse `
+            --verify `
+            "$reference^{commit}" `
+            *> $null
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Git reference was not found: $reference"
+        }
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Comparison ranges
+    # -------------------------------------------------------------------------
+
+    $commitRange =
+        "$Base..$Compare"
+
+    $diffRange =
+        "$Base...$Compare"
+
+
+    # -------------------------------------------------------------------------
+    # Count feature commits
+    # -------------------------------------------------------------------------
+
+    $commitCount =
+        & git -C $repositoryRoot `
+            rev-list `
+            --count `
+            $commitRange
+
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Unable to calculate the Git commit count.'
+    }
+
+    $commitCount =
+        [int]([string]$commitCount).Trim()
+
+
+    # -------------------------------------------------------------------------
+    # Collect changed files
+    # -------------------------------------------------------------------------
+
+    $nameStatusLines = @(
+        & git -C $repositoryRoot `
+            diff `
+            --name-status `
+            $diffRange
+    )
+
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Unable to determine changed files.'
+    }
+
+    $fileChanges = @(
+        foreach ($line in $nameStatusLines) {
+
+            if ([string]::IsNullOrWhiteSpace($line)) {
+                continue
+            }
+
+            $parts =
+                $line -split "`t"
+
+            $status =
+                $parts[0]
+
+            $displayPath =
+                if ($parts.Count -ge 3) {
+                    "$($parts[1]) -> $($parts[2])"
+                }
+                elseif ($parts.Count -ge 2) {
+                    $parts[1]
+                }
+                else {
+                    ''
+                }
+
+            [pscustomobject]@{
+                Status = $status
+                File   = $displayPath
+            }
+        }
+    )
+
+
+    # -------------------------------------------------------------------------
+    # File status statistics
+    # -------------------------------------------------------------------------
+
+    $addedCount = @(
+        $fileChanges |
+            Where-Object Status -Match '^A'
+    ).Count
+
+    $modifiedCount = @(
+        $fileChanges |
+            Where-Object Status -Match '^M'
+    ).Count
+
+    $deletedCount = @(
+        $fileChanges |
+            Where-Object Status -Match '^D'
+    ).Count
+
+    $renamedCount = @(
+        $fileChanges |
+            Where-Object Status -Match '^R'
+    ).Count
+
+    $copiedCount = @(
+        $fileChanges |
+            Where-Object Status -Match '^C'
+    ).Count
+
+
+    # -------------------------------------------------------------------------
+    # Line statistics
+    # -------------------------------------------------------------------------
+
+    $insertions = 0
+    $deletions = 0
+
+    $numberStatistics = @(
+        & git -C $repositoryRoot `
+            diff `
+            --numstat `
+            $diffRange
+    )
+
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Unable to calculate Git line statistics.'
+    }
+
+    foreach ($line in $numberStatistics) {
+
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+
+        $parts =
+            $line -split "`t"
+
+        if (
+            $parts.Count -ge 2 -and
+            $parts[0] -match '^\d+$'
+        ) {
+            $insertions += [int]$parts[0]
+        }
+
+        if (
+            $parts.Count -ge 2 -and
+            $parts[1] -match '^\d+$'
+        ) {
+            $deletions += [int]$parts[1]
+        }
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Display comparison summary
+    # -------------------------------------------------------------------------
+
+    Write-Host ''
+    Write-Host 'GIT BRANCH COMPARISON' -ForegroundColor Cyan
+    Write-Host '=====================' -ForegroundColor Cyan
+    Write-Host ''
+
+    Write-Host "Repository : $repositoryRoot"
+    Write-Host "Base       : $Base"
+    Write-Host "Compare    : $Compare"
+    Write-Host "Range      : $diffRange"
+    Write-Host ''
+
+    $summary =
+        [pscustomobject]@{
+            Commits    = $commitCount
+            Files      = $fileChanges.Count
+            Added      = $addedCount
+            Modified   = $modifiedCount
+            Deleted    = $deletedCount
+            Renamed    = $renamedCount
+            Copied     = $copiedCount
+            Insertions = $insertions
+            Deletions  = $deletions
+        }
+
+    Write-Host 'SUMMARY' -ForegroundColor Yellow
+    Write-Host ''
+
+    $summary |
+        Format-List |
+        Out-Host
+
+
+    # -------------------------------------------------------------------------
+    # Display changed files
+    # -------------------------------------------------------------------------
+
+    Write-Host 'CHANGED FILES' -ForegroundColor Yellow
+    Write-Host ''
+
+    if ($fileChanges.Count -eq 0) {
+
+        Write-Host 'No changed files were found.' `
+            -ForegroundColor Green
+    }
+    else {
+
+        $fileChanges |
+            Format-Table `
+                Status,
+                File `
+                -AutoSize |
+            Out-Host
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Display Git file statistics
+    # -------------------------------------------------------------------------
+
+    if ($fileChanges.Count -gt 0) {
+
+        Write-Host ''
+        Write-Host 'FILE STATISTICS' -ForegroundColor Yellow
+        Write-Host ''
+
+        & git -C $repositoryRoot `
+            --no-pager `
+            diff `
+            --stat `
+            $diffRange |
+            Out-Host
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Stop after statistics when requested
+    # -------------------------------------------------------------------------
+
+    if ($NoDiff -or $fileChanges.Count -eq 0) {
+        return
+    }
+
+
+    # -------------------------------------------------------------------------
+    # Open changed files through the configured Git difftool
+    # -------------------------------------------------------------------------
+
+    Write-Host ''
+    Write-Host 'VS CODE FILE COMPARISON' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host (
+        'Close the current VS Code diff when you are ready to move ' +
+        'to the next changed file.'
+    )
+    Write-Host ''
+
+    & git -C $repositoryRoot `
+        difftool `
+        -y `
+        $diffRange
+}
+
 function global:Enable-GitAutoPull {
     <#
     .SYNOPSIS
-        Enables automatic Git pull when entering repositories.
+        Enables automatic Git synchronization when entering repositories.
 
     .EXAMPLE
         gitpullon
@@ -1185,14 +1739,13 @@ function global:Enable-GitAutoPull {
         -Value $null `
         -Scope Global
 
-    Write-Host 'Git auto-pull enabled.' -ForegroundColor Green
+    Write-Host 'Git auto-sync enabled.' -ForegroundColor Green
 }
-
 
 function global:Disable-GitAutoPull {
     <#
     .SYNOPSIS
-        Disables automatic Git pull when entering repositories.
+        Disables automatic Git synchronization when entering repositories.
 
     .EXAMPLE
         gitpulloff
@@ -1211,14 +1764,13 @@ function global:Disable-GitAutoPull {
         -Value $null `
         -Scope Global
 
-    Write-Host 'Git auto-pull disabled.' -ForegroundColor Yellow
+    Write-Host 'Git auto-sync disabled.' -ForegroundColor Yellow
 }
-
 
 function global:Get-GitAutoPullStatus {
     <#
     .SYNOPSIS
-        Displays the current Git auto-pull configuration.
+        Displays the current Git auto-sync configuration.
 
     .EXAMPLE
         gitpullstate
@@ -1230,6 +1782,7 @@ function global:Get-GitAutoPullStatus {
     [pscustomobject]@{
         Enabled        = $global:ProfileGitAutoPullEnabled
         LastRepository = $global:ProfileGitAutoPullLastRoot
+        FetchCommand   = 'git fetch --prune <remote> +refs/heads/*:refs/remotes/<remote>/*'
         PullCommand    = 'git pull --ff-only'
     }
 }
@@ -2281,11 +2834,14 @@ function global:Deploy-CprsTestClient {
         -LiteralPath $sourceDirectory `
         -Force `
         -ErrorAction Stop |
-        Copy-Item `
-            -Destination $destinationDirectory `
-            -Recurse `
-            -Force `
-            -ErrorAction Stop
+    Where-Object {
+        $_.Name -ne 'Cprs.application'
+    } |
+    Copy-Item `
+        -Destination $destinationDirectory `
+        -Recurse `
+        -Force `
+        -ErrorAction Stop
 
 
     # -------------------------------------------------------------------------
@@ -6967,27 +7523,33 @@ function global:Get-ProfileAliasDefinition {
         }
         [pscustomobject]@{
             Category    = 'Git'
+            Alias       = 'gcompare'
+            Command     = 'Compare-GitBranch'
+            Description = 'Compare Git branches, show change statistics, and review changed files in VS Code'
+        }
+        [pscustomobject]@{
+            Category    = 'Git'
             Alias       = 'gitpullon'
             Command     = 'Enable-GitAutoPull'
-            Description = 'Enable automatic git pull when entering repositories'
+            Description = 'Enable automatic all-branch Git fetch/prune and fast-forward pull when entering repositories'
         }    
         [pscustomobject]@{
             Category    = 'Git'
             Alias       = 'gitpulloff'
             Command     = 'Disable-GitAutoPull'
-            Description = 'Disable automatic git pull when entering repositories'
+            Description = 'Disable automatic Git synchronization when entering repositories'
         }        
         [pscustomobject]@{
             Category    = 'Git'
             Alias       = 'gitpullstate'
             Command     = 'Get-GitAutoPullStatus'
-            Description = 'Display Git auto-pull status'
+            Description = 'Display Git auto-sync status'
         }        
         [pscustomobject]@{
             Category    = 'Git'
             Alias       = 'cd'
             Command     = 'Set-LocationAndGitPull'
-            Description = 'Change directory and automatically pull a newly entered Git repository'
+            Description = 'Change directory and automatically synchronize a newly entered Git repository'
         }
     )
 }
@@ -7802,11 +8364,13 @@ function global:Initialize-ProfilePSReadLine {
     }
 
     try {
-        Import-Module PSReadLine -ErrorAction Stop
+        if ($null -eq (Get-Module -Name PSReadLine)) {
+            Import-Module PSReadLine -ErrorAction Stop
+        }
 
         $profileAliasPredictorPath = Join-Path `
-        $HOME `
-        'Documents\PowerShell\Projects\ProfileAliasPredictor\bin\Release\net10.0\ProfileAliasPredictor.dll'
+            $global:ProfileAliasPredictorRoot `
+            'bin\Release\net10.0\ProfileAliasPredictor.dll'
 
         if (
             (Test-Path -LiteralPath $profileAliasPredictorPath -PathType Leaf) -and
@@ -7827,17 +8391,27 @@ function global:Initialize-ProfilePSReadLine {
         Set-PSReadLineOption -MaximumHistoryCount 10000
         Set-PSReadLineOption -BellStyle None
         Set-PSReadLineOption -ShowToolTips
-
+        
         $predictionSource = 'History'
+
+        $pluginAvailable =
+            $null -ne (Get-Module -Name ProfileAliasPredictor)
 
         if ($null -ne (Get-Module -ListAvailable -Name CompletionPredictor)) {
             try {
-                Import-Module CompletionPredictor -ErrorAction Stop
-                $predictionSource = 'HistoryAndPlugin'
+                if ($null -eq (Get-Module -Name CompletionPredictor)) {
+                    Import-Module CompletionPredictor -ErrorAction Stop
+                }
+
+                $pluginAvailable = $true
             }
             catch {
                 Write-Verbose "CompletionPredictor could not be imported: $($_.Exception.Message)"
             }
+        }
+
+        if ($pluginAvailable) {
+            $predictionSource = 'HistoryAndPlugin'
         }
 
         Set-PSReadLineOption `
@@ -7872,3 +8446,4 @@ function global:Initialize-ProfilePSReadLine {
 
 Register-ProfileAlias
 Initialize-ProfilePSReadLine
+
