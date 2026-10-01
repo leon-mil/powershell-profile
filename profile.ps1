@@ -1788,6 +1788,44 @@ function global:Get-GitAutoPullStatus {
 }
 
 # =============================================================================
+# CPRS Git Activity Report
+# =============================================================================
+
+function global:Invoke-CprsGitReport {
+    <#
+    .SYNOPSIS
+        Generates an interactive CPRS Git activity report.
+
+    .EXAMPLE
+        gitreport
+
+    .EXAMPLE
+        gitreport -Help
+
+    .EXAMPLE
+        gitreport -Days 90 -AllBranches -Format Both -OpenReport
+    #>
+
+    $scriptPath = Join-Path `
+        $HOME `
+        'Development\scripts\powershell\GitReport\Get-CprsGitReport.ps1'
+
+    if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
+        Write-Warning "Git Report script not found: $scriptPath"
+        return
+    }
+
+    # Display complete script documentation.
+    if ($args -contains '-Help' -or $args -contains '-?') {
+        Get-Help -Name $scriptPath -Full
+        return
+    }
+
+    # Execute the reporting script with supplied arguments.
+    & $scriptPath @args
+}
+
+# =============================================================================
 # CPRS build and deployment
 # =============================================================================
 
@@ -7550,6 +7588,12 @@ function global:Get-ProfileAliasDefinition {
             Alias       = 'cd'
             Command     = 'Set-LocationAndGitPull'
             Description = 'Change directory and automatically synchronize a newly entered Git repository'
+        }
+        [pscustomobject]@{
+            Category    = 'Git'
+            Alias       = 'gitreport'
+            Command     = 'Invoke-CprsGitReport'
+            Description = 'Generate interactive Git activity reports across CPRS repositories'
         }
     )
 }
