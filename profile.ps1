@@ -1298,6 +1298,452 @@ function global:Get-GitChangedFile {
     & git status --short
 }
 
+function global:Find-CprsGitBranch {
+    <#
+    .SYNOPSIS
+        Searches for Git branches across the CPRS repositories.
+
+    .DESCRIPTION
+        Searches local branches and origin remote-tracking branches across:
+
+            Cprs
+            cprs-sasprogs
+            cprs-batch
+            cprs-rprogs
+
+        A search value without wildcard characters is treated as a partial
+        branch-name search.
+
+        Examples:
+
+            dodge
+                Searches for *dodge*
+
+            cr2337
+                Searches for *cr2337*
+
+            fix/*
+                Searches for branches beginning with fix/
+
+            *locking*
+                Searches for branches containing locking.
+
+            *
+                Displays all branches.
+
+        Use -Fetch to refresh all origin branch heads before searching.
+
+    .PARAMETER Pattern
+        Branch name, partial branch name, or PowerShell wildcard pattern.
+
+        If no wildcard characters are supplied, the value is automatically
+        surrounded with * characters.
+
+    .PARAMETER Fetch
+        Refreshes all branch heads from origin and prunes stale remote-tracking
+        branches before searching.
+
+    .PARAMETER PassThru
+        Returns the result objects instead of formatting them as a table.
+
+    .EXAMPLE
+        branchfind dodge
+
+    .EXAMPLE
+        branchfind cr2337
+
+    .EXAMPLE
+        branchfind 'fix/*'
+
+    .EXAMPLE
+        branchfind '*locking*'
+
+    .EXAMPLE
+        branchfind '*'
+
+    .EXAMPLE
+        branchfind dodge -Fetch
+
+    .EXAMPLE
+        branchfind '*2337*' -PassThru
+    #>
+
+    [CmdletBinding()]
+    param(
+        [Parameter(
+            Mandatory,
+            Position = 0
+        )]
+        [ValidateNotNullOrEmpty()]
+        [string]$Pattern,
+
+        [switch]$Fetch,
+
+        [switch]$PassThru
+    )
+
+    # -------------------------------------------------------------------------
+    # Configuration
+    # -------------------------------------------------------------------------
+
+    $repositoryRoot =
+        'C:\Development-CPRS'
+
+    $repositories = @(
+        'Cprs'
+        'cprs-sasprogs'
+        'cprs-batch'
+        'cprs-rprogs'
+    )
+
+    # -------------------------------------------------------------------------
+    # Validate Git
+    # -------------------------------------------------------------------------
+
+    if ($null -eq (
+        Get-Command git `
+            -ErrorAction SilentlyContinue
+    )) {
+        throw 'Git is not installed or is not available in PATH.'
+    }
+
+    # -------------------------------------------------------------------------
+    # Resolve search pattern
+    # -------------------------------------------------------------------------
+
+    $Pattern =
+        $Pattern.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($Pattern)) {
+        throw 'A branch search pattern is required.'
+    }
+
+    $containsWildcard =
+        [System.Management.Automation.WildcardPattern]::
+            ContainsWildcardCharacters(
+                $Pattern
+            )
+
+    $searchPattern =
+        if ($containsWildcard) {
+            $Pattern
+        }
+        else {
+            "*$Pattern*"
+        }
+
+    $wildcard =
+        [System.Management.Automation.WildcardPattern]::new(
+            $searchPattern,
+            [System.Management.Automation.WildcardOptions]::IgnoreCase
+        )
+
+    # -------------------------------------------------------------------------
+    # Search repositories
+    # -------------------------------------------------------------------------
+
+    $results = @()
+
+    foreach ($repository in $repositories) {
+
+        $repositoryPath =
+            Join-Path `
+                $repositoryRoot `
+                $repository
+
+        # ---------------------------------------------------------------------
+        # Validate repository path
+        # ---------------------------------------------------------------------
+
+        if (-not (
+            Test-Path `
+                -LiteralPath $repositoryPath `
+                -PathType Container
+        )) {
+            $results +=
+                [pscustomobject]@{
+                    Repository = $repository
+                    Branch     = '-'
+                    Local      = '-'
+                    Origin     = '-'
+                    Status     = 'REPOSITORY NOT FOUND'
+                }
+
+            continue
+        }
+
+        # ---------------------------------------------------------------------
+        # Validate Git repository
+        # ---------------------------------------------------------------------
+
+        & git `
+            -C $repositoryPath `
+            rev-parse `
+            --git-dir `
+            *> $null
+
+        if ($LASTEXITCODE -ne 0) {
+            $results +=
+                [pscustomobject]@{
+                    Repository = $repository
+                    Branch     = '-'
+                    Local      = '-'
+                    Origin     = '-'
+                    Status     = 'NOT A GIT REPOSITORY'
+                }
+
+            continue
+        }
+
+        # ---------------------------------------------------------------------
+        # Optional origin refresh
+        #
+        # Use an explicit wildcard refspec so every origin branch head is
+        # refreshed even if the repository has a restricted fetch refspec.
+        # ---------------------------------------------------------------------
+
+        if ($Fetch) {
+
+            $fetchRefSpec =
+                '+refs/heads/*:refs/remotes/origin/*'
+
+            & git `
+                -C $repositoryPath `
+                fetch `
+                --prune `
+                origin `
+                $fetchRefSpec `
+                --quiet
+
+            if ($LASTEXITCODE -ne 0) {
+                $results +=
+                    [pscustomobject]@{
+                        Repository = $repository
+                        Branch     = '-'
+                        Local      = '-'
+                        Origin     = '-'
+                        Status     = 'FETCH FAILED'
+                    }
+
+                continue
+            }
+        }
+
+        # ---------------------------------------------------------------------
+        # Local branches
+        # ---------------------------------------------------------------------
+
+        $localBranches = @(
+            & git `
+                -C $repositoryPath `
+                for-each-ref `
+                '--format=%(refname:short)' `
+                refs/heads `
+                2>$null
+        ) |
+            Where-Object {
+                -not [string]::IsNullOrWhiteSpace($_)
+            }
+
+        if ($LASTEXITCODE -ne 0) {
+            $results +=
+                [pscustomobject]@{
+                    Repository = $repository
+                    Branch     = '-'
+                    Local      = '-'
+                    Origin     = '-'
+                    Status     = 'LOCAL BRANCH READ FAILED'
+                }
+
+            continue
+        }
+
+        # ---------------------------------------------------------------------
+        # Origin branches
+        # ---------------------------------------------------------------------
+
+        $originBranchRows = @(
+            & git `
+                -C $repositoryPath `
+                for-each-ref `
+                '--format=%(refname:short)|%(symref)' `
+                refs/remotes/origin `
+                2>$null
+        )
+
+        if ($LASTEXITCODE -ne 0) {
+            $results +=
+                [pscustomobject]@{
+                    Repository = $repository
+                    Branch     = '-'
+                    Local      = '-'
+                    Origin     = '-'
+                    Status     = 'ORIGIN BRANCH READ FAILED'
+                }
+
+            continue
+        }
+
+        $originBranches = @(
+            foreach ($row in $originBranchRows) {
+
+                if ([string]::IsNullOrWhiteSpace($row)) {
+                    continue
+                }
+
+                $parts =
+                    ([string]$row).Split(
+                        '|',
+                        2
+                    )
+
+                $refName =
+                    $parts[0].Trim()
+
+                $symbolicTarget =
+                    if ($parts.Count -gt 1) {
+                        $parts[1].Trim()
+                    }
+                    else {
+                        ''
+                    }
+
+                # Skip symbolic refs such as origin/HEAD.
+                if (-not [string]::IsNullOrWhiteSpace($symbolicTarget)) {
+                    continue
+                }
+
+                if ($refName.StartsWith(
+                    'origin/',
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )) {
+                    $refName.Substring(
+                        'origin/'.Length
+                    )
+                }
+            }
+        )
+
+        # ---------------------------------------------------------------------
+        # Build unique branch list and apply wildcard search
+        # ---------------------------------------------------------------------
+
+        $matchingBranches = @(
+            @(
+                $localBranches
+                $originBranches
+            ) |
+                Sort-Object -Unique |
+                Where-Object {
+                    $wildcard.IsMatch(
+                        [string]$_
+                    )
+                }
+        )
+
+        # ---------------------------------------------------------------------
+        # Nothing matched in this repository
+        # ---------------------------------------------------------------------
+
+        if ($matchingBranches.Count -eq 0) {
+            $results +=
+                [pscustomobject]@{
+                    Repository = $repository
+                    Branch     = '-'
+                    Local      = 'NO'
+                    Origin     = 'NO'
+                    Status     = 'NOT FOUND'
+                }
+
+            continue
+        }
+
+        # ---------------------------------------------------------------------
+        # Report every matching branch
+        # ---------------------------------------------------------------------
+
+        foreach ($branchName in $matchingBranches) {
+
+            $localExists =
+                $localBranches -contains $branchName
+
+            $originExists =
+                $originBranches -contains $branchName
+
+            $status =
+                if (
+                    $localExists -and
+                    $originExists
+                ) {
+                    'LOCAL + ORIGIN'
+                }
+                elseif ($localExists) {
+                    'LOCAL ONLY'
+                }
+                elseif ($originExists) {
+                    'ORIGIN ONLY'
+                }
+                else {
+                    'UNKNOWN'
+                }
+
+            $results +=
+                [pscustomobject]@{
+                    Repository = $repository
+                    Branch     = $branchName
+                    Local      = if ($localExists) {
+                        'YES'
+                    }
+                    else {
+                        'NO'
+                    }
+                    Origin     = if ($originExists) {
+                        'YES'
+                    }
+                    else {
+                        'NO'
+                    }
+                    Status     = $status
+                }
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # Structured output when requested
+    # -------------------------------------------------------------------------
+
+    if ($PassThru) {
+        return $results
+    }
+
+    # -------------------------------------------------------------------------
+    # Display results
+    # -------------------------------------------------------------------------
+
+    Write-Host ''
+    Write-Host 'CPRS GIT BRANCH SEARCH' `
+        -ForegroundColor Cyan
+
+    Write-Host '======================' `
+        -ForegroundColor Cyan
+
+    Write-Host ''
+    Write-Host "Search pattern : $Pattern"
+    Write-Host "Resolved       : $searchPattern"
+    Write-Host "Refresh origin : $([bool]$Fetch)"
+    Write-Host ''
+
+    $results |
+        Format-Table `
+            Repository,
+            Branch,
+            Local,
+            Origin,
+            Status `
+            -AutoSize |
+        Out-Host
+}
+
 function global:Compare-GitBranch {
     <#
     .SYNOPSIS
@@ -7558,6 +8004,12 @@ function global:Get-ProfileAliasDefinition {
             Alias       = 'gfile'
             Command     = 'Get-GitChangedFile'
             Description = 'Show staged, unstaged, and untracked files'
+        }
+        [pscustomobject]@{
+            Category    = 'Git'
+            Alias       = 'branchfind'
+            Command     = 'Find-CprsGitBranch'
+            Description = 'Search local and origin branches across CPRS repositories'
         }
         [pscustomobject]@{
             Category    = 'Git'
