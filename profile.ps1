@@ -933,7 +933,7 @@ function global:Test-ProfileAliasPredictor {
             $missingAliases.Alias -join ', '
         }
         else {
-            ''
+            'None'
         }
         Status              = $status
     }
@@ -1044,6 +1044,629 @@ function global:Edit-CommandHistory {
     Invoke-Item -LiteralPath $historyPath
 }
 
+# =============================================================================
+# Profile deployment
+# =============================================================================
+
+function global:Deploy-PowerShellToVdi {
+    <#
+    .SYNOPSIS
+        Deploys the local PowerShell profile and ProfileAliasPredictor to VDI.
+
+    .DESCRIPTION
+        Deploys the current local PowerShell development files to the
+        persistent VDI PowerShell location on H:.
+
+        Deploys:
+
+            profile.ps1
+
+            Projects\ProfileAliasPredictor
+                ProfileAliasPredictor.cs
+                project/source files
+                compiled Release output
+
+        The predictor is built locally into a temporary directory before
+        deployment. This avoids rebuilding the predictor on VDI.
+
+        The deployment validates:
+
+            profile.ps1
+            ProfileAliasPredictor.cs
+            ProfileAliasPredictor.dll
+
+        using SHA256 hashes after deployment.
+
+        The predictor .git, .vs, bin, and obj directories are not copied as
+        source. The newly compiled Release output is deployed separately.
+
+    .EXAMPLE
+        vdi-profile-deploy
+
+    .EXAMPLE
+        vdi-profile-deploy -WhatIf
+    #>
+
+    [CmdletBinding(
+        SupportsShouldProcess = $true,
+        ConfirmImpact = 'Medium'
+    )]
+    param()
+
+    # -------------------------------------------------------------------------
+    # Configuration
+    # -------------------------------------------------------------------------
+
+    $sourceRoot =
+        $global:PowerShellProfileRoot
+
+    $destinationRoot =
+        'H:\Documents\PowerShell'
+
+    $sourceProfile =
+        Join-Path `
+            $sourceRoot `
+            'profile.ps1'
+
+    $destinationProfile =
+        Join-Path `
+            $destinationRoot `
+            'profile.ps1'
+
+    $sourcePredictor =
+        Join-Path `
+            $sourceRoot `
+            'Projects\ProfileAliasPredictor'
+
+    $destinationPredictor =
+        Join-Path `
+            $destinationRoot `
+            'Projects\ProfileAliasPredictor'
+
+    $sourcePredictorFile =
+        Join-Path `
+            $sourcePredictor `
+            'ProfileAliasPredictor.cs'
+
+    $destinationPredictorFile =
+        Join-Path `
+            $destinationPredictor `
+            'ProfileAliasPredictor.cs'
+
+    $predictorProject =
+        Join-Path `
+            $sourcePredictor `
+            'ProfileAliasPredictor.csproj'
+
+    # -------------------------------------------------------------------------
+    # Validate source and destination
+    # -------------------------------------------------------------------------
+
+    if (-not (
+        Test-Path `
+            -LiteralPath $sourceProfile `
+            -PathType Leaf
+    )) {
+        throw "Profile was not found: $sourceProfile"
+    }
+
+    if (-not (
+        Test-Path `
+            -LiteralPath $sourcePredictor `
+            -PathType Container
+    )) {
+        throw "ProfileAliasPredictor was not found: $sourcePredictor"
+    }
+
+    if (-not (
+        Test-Path `
+            -LiteralPath $sourcePredictorFile `
+            -PathType Leaf
+    )) {
+        throw (
+            'ProfileAliasPredictor source file was not found: ' +
+            $sourcePredictorFile
+        )
+    }
+
+    if (-not (
+        Test-Path `
+            -LiteralPath $predictorProject `
+            -PathType Leaf
+    )) {
+        throw (
+            'ProfileAliasPredictor project was not found: ' +
+            $predictorProject
+        )
+    }
+
+    if (-not (
+        Test-Path `
+            -LiteralPath $destinationRoot `
+            -PathType Container
+    )) {
+        throw (
+            "VDI PowerShell directory is not available: $destinationRoot"
+        )
+    }
+
+    if ($null -eq (
+        Get-Command dotnet `
+            -ErrorAction SilentlyContinue
+    )) {
+        throw 'dotnet was not found in PATH.'
+    }
+
+    if ($null -eq (
+        Get-Command robocopy `
+            -ErrorAction SilentlyContinue
+    )) {
+        throw 'robocopy was not found.'
+    }
+
+    # -------------------------------------------------------------------------
+    # Validate profile syntax
+    # -------------------------------------------------------------------------
+
+    $tokens =
+        $null
+
+    $parseErrors =
+        $null
+
+    [System.Management.Automation.Language.Parser]::ParseFile(
+        $sourceProfile,
+        [ref]$tokens,
+        [ref]$parseErrors
+    ) |
+        Out-Null
+
+    if ($parseErrors.Count -gt 0) {
+
+        $parseErrorText =
+            $parseErrors |
+            ForEach-Object {
+                "Line $($_.Extent.StartLineNumber): $($_.Message)"
+            }
+
+        throw (
+            "Profile contains parser errors:`n" +
+            ($parseErrorText -join [Environment]::NewLine)
+        )
+    }
+
+    # -------------------------------------------------------------------------
+    # Determine predictor target framework
+    # -------------------------------------------------------------------------
+
+    $projectContent =
+        Get-Content `
+            -LiteralPath $predictorProject `
+            -Raw `
+            -ErrorAction Stop
+
+    $targetFrameworkMatch =
+        [regex]::Match(
+            $projectContent,
+            '<TargetFramework>\s*([^<]+)\s*</TargetFramework>'
+        )
+
+    if (-not $targetFrameworkMatch.Success) {
+        throw (
+            'Unable to determine TargetFramework from: ' +
+            $predictorProject
+        )
+    }
+
+    $targetFramework =
+        $targetFrameworkMatch.Groups[1].Value.Trim()
+
+    $destinationBuildDirectory =
+        Join-Path `
+            $destinationPredictor `
+            "bin\Release\$targetFramework"
+
+    $destinationPredictorDll =
+        Join-Path `
+            $destinationBuildDirectory `
+            'ProfileAliasPredictor.dll'
+
+    # -------------------------------------------------------------------------
+    # Display deployment plan
+    # -------------------------------------------------------------------------
+
+    Write-Host ''
+    Write-Host 'POWERSHELL VDI DEPLOYMENT' `
+        -ForegroundColor Cyan
+
+    Write-Host '=========================' `
+        -ForegroundColor Cyan
+
+    Write-Host ''
+    Write-Host "Profile source       : $sourceProfile"
+    Write-Host "Profile destination  : $destinationProfile"
+    Write-Host ''
+    Write-Host "Predictor source     : $sourcePredictor"
+    Write-Host "Predictor destination: $destinationPredictor"
+    Write-Host ''
+    Write-Host "Target framework     : $targetFramework"
+    Write-Host "Predictor DLL        : $destinationPredictorDll"
+    Write-Host ''
+
+    # -------------------------------------------------------------------------
+    # WhatIf / confirmation
+    # -------------------------------------------------------------------------
+
+    if (-not (
+        $PSCmdlet.ShouldProcess(
+            $destinationRoot,
+            'Build and deploy PowerShell profile and ProfileAliasPredictor'
+        )
+    )) {
+        return
+    }
+
+    # -------------------------------------------------------------------------
+    # Verify VDI predictor DLL is not locked
+    # -------------------------------------------------------------------------
+
+    if (
+        Test-Path `
+            -LiteralPath $destinationPredictorDll `
+            -PathType Leaf
+    ) {
+        $dllStream =
+            $null
+
+        try {
+            $dllStream =
+                [System.IO.File]::Open(
+                    $destinationPredictorDll,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::ReadWrite,
+                    [System.IO.FileShare]::None
+                )
+        }
+        catch {
+            throw (
+                'The VDI predictor DLL is currently locked. ' +
+                'Close all PowerShell 7 sessions on VDI and run the ' +
+                "deployment again.`n`n" +
+                $destinationPredictorDll
+            )
+        }
+        finally {
+            if ($dllStream) {
+                $dllStream.Dispose()
+            }
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # Build predictor locally
+    # -------------------------------------------------------------------------
+
+    $temporaryBuildDirectory =
+        Join-Path `
+            $env:TEMP `
+            (
+                'ProfileAliasPredictor-VDI-' +
+                [guid]::NewGuid().ToString('N')
+            )
+
+    try {
+
+        Write-Host ''
+        Write-Host 'BUILDING PROFILE ALIAS PREDICTOR' `
+            -ForegroundColor Cyan
+
+        Write-Host '================================' `
+            -ForegroundColor Cyan
+
+        Write-Host ''
+
+        New-Item `
+            -ItemType Directory `
+            -Path $temporaryBuildDirectory `
+            -Force `
+            -ErrorAction Stop |
+            Out-Null
+
+        & dotnet `
+            build `
+            $predictorProject `
+            -c Release `
+            -o $temporaryBuildDirectory `
+            --nologo
+
+        if ($LASTEXITCODE -ne 0) {
+            throw (
+                'ProfileAliasPredictor build failed. ' +
+                "Exit code: $LASTEXITCODE"
+            )
+        }
+
+        $localPredictorDll =
+            Join-Path `
+                $temporaryBuildDirectory `
+                'ProfileAliasPredictor.dll'
+
+        if (-not (
+            Test-Path `
+                -LiteralPath $localPredictorDll `
+                -PathType Leaf
+        )) {
+            throw (
+                'Predictor build completed but the DLL was not found: ' +
+                $localPredictorDll
+            )
+        }
+
+        Write-Host ''
+        Write-Host 'Predictor build succeeded.' `
+            -ForegroundColor Green
+
+        # ---------------------------------------------------------------------
+        # Calculate local hashes
+        # ---------------------------------------------------------------------
+
+        $localProfileHash =
+            (
+                Get-FileHash `
+                    -LiteralPath $sourceProfile `
+                    -Algorithm SHA256 `
+                    -ErrorAction Stop
+            ).Hash
+
+        $localPredictorSourceHash =
+            (
+                Get-FileHash `
+                    -LiteralPath $sourcePredictorFile `
+                    -Algorithm SHA256 `
+                    -ErrorAction Stop
+            ).Hash
+
+        $localPredictorDllHash =
+            (
+                Get-FileHash `
+                    -LiteralPath $localPredictorDll `
+                    -Algorithm SHA256 `
+                    -ErrorAction Stop
+            ).Hash
+
+        # ---------------------------------------------------------------------
+        # Deploy profile
+        # ---------------------------------------------------------------------
+
+        Write-Host ''
+        Write-Host 'DEPLOYING TO VDI' `
+            -ForegroundColor Cyan
+
+        Write-Host '================' `
+            -ForegroundColor Cyan
+
+        Write-Host ''
+
+        Copy-Item `
+            -LiteralPath $sourceProfile `
+            -Destination $destinationProfile `
+            -Force `
+            -ErrorAction Stop
+
+        # ---------------------------------------------------------------------
+        # Deploy predictor source
+        # ---------------------------------------------------------------------
+
+        & robocopy `
+            $sourcePredictor `
+            $destinationPredictor `
+            /E `
+            /COPY:DAT `
+            /DCOPY:DAT `
+            /R:2 `
+            /W:2 `
+            /NFL `
+            /NDL `
+            /NJH `
+            /NJS `
+            /NP `
+            /XD `
+            '.git' `
+            '.vs' `
+            'bin' `
+            'obj'
+
+        $robocopyExitCode =
+            $LASTEXITCODE
+
+        if ($robocopyExitCode -ge 8) {
+            throw (
+                'ProfileAliasPredictor source deployment failed. ' +
+                "Robocopy exit code: $robocopyExitCode"
+            )
+        }
+
+        # ---------------------------------------------------------------------
+        # Deploy compiled predictor
+        # ---------------------------------------------------------------------
+
+        if (-not (
+            Test-Path `
+                -LiteralPath $destinationBuildDirectory `
+                -PathType Container
+        )) {
+            New-Item `
+                -ItemType Directory `
+                -Path $destinationBuildDirectory `
+                -Force `
+                -ErrorAction Stop |
+                Out-Null
+        }
+
+        & robocopy `
+            $temporaryBuildDirectory `
+            $destinationBuildDirectory `
+            /E `
+            /COPY:DAT `
+            /DCOPY:DAT `
+            /R:2 `
+            /W:2 `
+            /NFL `
+            /NDL `
+            /NJH `
+            /NJS `
+            /NP
+
+        $robocopyExitCode =
+            $LASTEXITCODE
+
+        if ($robocopyExitCode -ge 8) {
+            throw (
+                'ProfileAliasPredictor DLL deployment failed. ' +
+                "Robocopy exit code: $robocopyExitCode"
+            )
+        }
+
+        # ---------------------------------------------------------------------
+        # Validate deployed files
+        # ---------------------------------------------------------------------
+
+        Write-Host ''
+        Write-Host 'DEPLOYMENT VALIDATION' `
+            -ForegroundColor Cyan
+
+        Write-Host '=====================' `
+            -ForegroundColor Cyan
+
+        Write-Host ''
+
+        $vdiProfileHash =
+            (
+                Get-FileHash `
+                    -LiteralPath $destinationProfile `
+                    -Algorithm SHA256 `
+                    -ErrorAction Stop
+            ).Hash
+
+        $vdiPredictorSourceHash =
+            (
+                Get-FileHash `
+                    -LiteralPath $destinationPredictorFile `
+                    -Algorithm SHA256 `
+                    -ErrorAction Stop
+            ).Hash
+
+        $vdiPredictorDllHash =
+            (
+                Get-FileHash `
+                    -LiteralPath $destinationPredictorDll `
+                    -Algorithm SHA256 `
+                    -ErrorAction Stop
+            ).Hash
+
+        $validationResults =
+            @(
+                [pscustomobject]@{
+                    File         = 'profile.ps1'
+                    LocalSHA256  = $localProfileHash
+                    VDISHA256    = $vdiProfileHash
+                    Status       = if (
+                        $localProfileHash -eq $vdiProfileHash
+                    ) {
+                        'MATCH'
+                    }
+                    else {
+                        'MISMATCH'
+                    }
+                }
+
+                [pscustomobject]@{
+                    File         = 'ProfileAliasPredictor.cs'
+                    LocalSHA256  = $localPredictorSourceHash
+                    VDISHA256    = $vdiPredictorSourceHash
+                    Status       = if (
+                        $localPredictorSourceHash -eq
+                        $vdiPredictorSourceHash
+                    ) {
+                        'MATCH'
+                    }
+                    else {
+                        'MISMATCH'
+                    }
+                }
+
+                [pscustomobject]@{
+                    File         = 'ProfileAliasPredictor.dll'
+                    LocalSHA256  = $localPredictorDllHash
+                    VDISHA256    = $vdiPredictorDllHash
+                    Status       = if (
+                        $localPredictorDllHash -eq
+                        $vdiPredictorDllHash
+                    ) {
+                        'MATCH'
+                    }
+                    else {
+                        'MISMATCH'
+                    }
+                }
+            )
+
+        $validationResults |
+            Format-Table `
+                File,
+                LocalSHA256,
+                VDISHA256,
+                Status `
+                -AutoSize |
+            Out-Host
+
+        $validationFailed =
+            @(
+                $validationResults |
+                    Where-Object Status -NE 'MATCH'
+            ).Count -gt 0
+
+        if ($validationFailed) {
+            throw (
+                'VDI deployment completed, but SHA256 validation failed.'
+            )
+        }
+
+        # ---------------------------------------------------------------------
+        # Complete
+        # ---------------------------------------------------------------------
+
+        Write-Host ''
+        Write-Host 'VDI PowerShell deployment succeeded.' `
+            -ForegroundColor Green
+
+        Write-Host ''
+        Write-Host 'Profile          : VERIFIED'
+        Write-Host 'Predictor source : VERIFIED'
+        Write-Host 'Predictor DLL    : VERIFIED'
+
+        Write-Host ''
+        Write-Host 'On VDI, open a new PowerShell session and run:' `
+            -ForegroundColor Cyan
+
+        Write-Host ''
+        Write-Host '  predtest'
+        Write-Host ''
+    }
+    finally {
+
+        if (
+            Test-Path `
+                -LiteralPath $temporaryBuildDirectory
+        ) {
+            Remove-Item `
+                -LiteralPath $temporaryBuildDirectory `
+                -Recurse `
+                -Force `
+                -ErrorAction SilentlyContinue
+        }
+    }
+}
 
 # =============================================================================
 # Development navigation
@@ -7734,6 +8357,12 @@ function global:Get-ProfileAliasDefinition {
             Alias       = 'predtest'
             Command     = 'Test-ProfileAliasPredictor'
             Description = 'Verify the PowerShell profile and predictor configuration'
+        }
+        [pscustomobject]@{
+            Category    = 'ProfileDev'
+            Alias       = 'vdi-profile-deploy'
+            Command     = 'Deploy-PowerShellToVdi'
+            Description = 'Deploy the PowerShell profile and ProfileAliasPredictor to VDI'
         }
 
 
