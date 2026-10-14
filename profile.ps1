@@ -5440,15 +5440,66 @@ ORDER BY EMAIL;
                         $productionShortcut
                     )
 
-                if (-not (
-                    $shortcut.TargetPath.Equals(
-                        $productionExecutable,
-                        [System.StringComparison]::OrdinalIgnoreCase
+                    $expectedShortcutTargets =
+                    @(
+                        $productionExecutable
                     )
-                )) {
+                
+                $productionDriveName =
+                    [System.IO.Path]::GetPathRoot(
+                        $productionExecutable
+                    ).
+                        TrimEnd('\').
+                        TrimEnd(':')
+                
+                $productionDrive =
+                    Get-PSDrive `
+                        -Name $productionDriveName `
+                        -PSProvider FileSystem `
+                        -ErrorAction SilentlyContinue
+                
+                if (
+                    $productionDrive -and
+                    $productionDrive.DisplayRoot
+                ) {
+                    $relativeExecutablePath =
+                        $productionExecutable.Substring(
+                            $productionDrive.Root.Length
+                        )
+                
+                    $uncProductionExecutable =
+                        Join-Path `
+                            $productionDrive.DisplayRoot `
+                            $relativeExecutablePath
+                
+                    $expectedShortcutTargets +=
+                        $uncProductionExecutable
+                }
+                
+                $shortcutTargetMatches =
+                    $false
+                
+                foreach ($expectedShortcutTarget in $expectedShortcutTargets) {
+                
+                    if (
+                        $shortcut.TargetPath.Equals(
+                            $expectedShortcutTarget,
+                            [System.StringComparison]::OrdinalIgnoreCase
+                        )
+                    ) {
+                        $shortcutTargetMatches =
+                            $true
+                
+                        break
+                    }
+                }
+                
+                if (-not $shortcutTargetMatches) {
                     throw (
-                        'Shortcut verification failed. Target is: ' +
-                        $shortcut.TargetPath
+                        'Shortcut verification failed. ' +
+                        "Target is: $($shortcut.TargetPath). " +
+                        'Expected one of: ' +
+                        ($expectedShortcutTargets -join ', ')
                     )
                 }
             }
