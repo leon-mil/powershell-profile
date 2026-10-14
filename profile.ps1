@@ -5444,20 +5444,20 @@ ORDER BY EMAIL;
                     @(
                         $productionExecutable
                     )
-                
+
                 $productionDriveName =
                     [System.IO.Path]::GetPathRoot(
                         $productionExecutable
                     ).
                         TrimEnd('\').
                         TrimEnd(':')
-                
+
                 $productionDrive =
                     Get-PSDrive `
                         -Name $productionDriveName `
                         -PSProvider FileSystem `
                         -ErrorAction SilentlyContinue
-                
+
                 if (
                     $productionDrive -and
                     $productionDrive.DisplayRoot
@@ -5466,21 +5466,21 @@ ORDER BY EMAIL;
                         $productionExecutable.Substring(
                             $productionDrive.Root.Length
                         )
-                
+
                     $uncProductionExecutable =
                         Join-Path `
                             $productionDrive.DisplayRoot `
                             $relativeExecutablePath
-                
+
                     $expectedShortcutTargets +=
                         $uncProductionExecutable
                 }
-                
+
                 $shortcutTargetMatches =
                     $false
-                
+
                 foreach ($expectedShortcutTarget in $expectedShortcutTargets) {
-                
+
                     if (
                         $shortcut.TargetPath.Equals(
                             $expectedShortcutTarget,
@@ -5493,7 +5493,7 @@ ORDER BY EMAIL;
                         break
                     }
                 }
-                
+
                 if (-not $shortcutTargetMatches) {
                     throw (
                         'Shortcut verification failed. ' +
