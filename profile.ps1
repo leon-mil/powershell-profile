@@ -3488,650 +3488,488 @@ function global:Send-CprsDeploymentEmail {
 function global:Deploy-CprsTestClient {
     <#
     .SYNOPSIS
-        Builds and/or deploys the CPRS client to V:\TEST\EXE.
+        Safely builds and deploys the CPRS client to V:\TEST\EXE.
 
     .DESCRIPTION
-        Deploys the CPRS Release build from:
+        Stages and verifies all files before replacing TEST. Archives the
+        previous destination and restores it if cutover/verification fails.
+        An SMB file lock prevents concurrent runs of this deployment function.
+        Failed interactive runs return Status=FAILED without an exception trace.
+        Automation should use -ThrowOnFailure or inspect the returned Status.
 
-            C:\Development-CPRS\Cprs\UI\bin\Release
+    .PARAMETER TestMode
+        Requires -Folder. Sends success email only to leon.mil@census.gov.
 
-        DEFAULT:
-            Builds CPRS.
-            Archives the existing V:\TEST\EXE\CPRS II build.
-            Replaces V:\TEST\EXE\CPRS II.
-
-        -SkipBuild:
-            Uses the existing local Release build.
-            Archives the existing CPRS II build.
-            Replaces CPRS II.
-
-        -Folder <folder>:
-            Builds CPRS.
-            Replaces V:\TEST\EXE\<folder>.
-            Does NOT modify CPRS II.
-            Does NOT create a CPRS II archive.
-
-        -Folder <folder> -SkipBuild:
-            Uses the existing Release build.
-            Replaces V:\TEST\EXE\<folder>.
-            Does NOT modify CPRS II.
-
-        -WhatIf:
-            Preview only.
-            Does NOT build CPRS.
-            Does NOT archive, remove, create, or copy files.
-
-    .PARAMETER SkipBuild
-        Uses the existing CPRS Release build instead of rebuilding CPRS.
-
-    .PARAMETER Folder
-        Deploys to a named folder directly below V:\TEST\EXE.
-
-        Example:
-
-            -Folder <folder>
-
-        Destination:
-
-            V:\TEST\EXE\<folder>
-
-        When Folder is supplied, CPRS II and Builds are not modified.
-
-    .EXAMPLE
-        cprs-test-deploy `
-            -Message "CR2249 deployment"
-
-        Build CPRS, archive the existing CPRS II build, and deploy the new
-        build to V:\TEST\EXE\CPRS II.
-
-    .EXAMPLE
-        cprs-test-deploy `
-            -SkipBuild `
-            -Message "CR2249 deployment"
-
-        Use the existing Release build, archive CPRS II, and replace CPRS II.
-
-    .EXAMPLE
-        cprs-test-deploy `
-            -Folder CR2249 `
-            -Message "CR2249 deployment"
-
-        Build CPRS and replace V:\TEST\EXE\CR2249.
-        CPRS II is not touched.
-
-    .EXAMPLE
-        cprs-test-deploy `
-            -Folder CR2249 `
-            -SkipBuild `
-            -Message "CR2249 deployment"
-
-        Use the existing Release build and replace V:\TEST\EXE\CR2249.
-
-    .EXAMPLE
-        cprs-test-deploy `
-            -Message "CR2249 deployment" `
-            -WhatIf
-
-        Preview a normal CPRS II deployment without building or copying.
-
-    .EXAMPLE
-        cprs-test-deploy `
-            -Folder CR2249 `
-            -Message "CR2249 deployment" `
-            -WhatIf
-
-        Preview deployment to the CR2249 folder without making changes.
+    .PARAMETER ValidationFailurePoint
+        Only allowed with -TestMode. Simulates a failure after archiving or
+        activation to exercise automatic rollback safely.
     #>
-
-    [CmdletBinding(
-        SupportsShouldProcess = $true,
-        ConfirmImpact = 'Medium'
-    )]
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
     param(
         [switch]$SkipBuild,
-
-        [Parameter()]
+        [switch]$TestMode,
         [ValidateNotNullOrEmpty()]
         [string]$Folder,
-
         [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
-        [string]$Message
+        [string]$Message,
+        [ValidateSet('None', 'AfterArchive', 'AfterActivation')]
+        [string]$ValidationFailurePoint = 'None',
+        [switch]$ThrowOnFailure
     )
 
-    $sourceDirectory =
-        'C:\Development-CPRS\Cprs\UI\bin\Release'
+    $source = 'C:\Development-CPRS\Cprs\UI\bin\Release'
+    $repository = 'C:\Development-CPRS\Cprs'
+    $root = 'V:\TEST\EXE'
+    $builds = Join-Path $root 'Builds'
+    $lockPath = Join-Path $root '_CPRS_TEST_DEPLOY.lock'
+    $start = Get-Date
+    $lockStream = $null
+    $destination = $null
+    $stage = $null
+    $archive = $null
+    $previous = $null
+    $expected = $null
+    $deployed = $null
+    $originalExisted = $false
+    $cutoverStarted = $false
+    $archiveMoved = $false
+    $stageMoved = $false
+    $rollbackSucceeded = $false
+    $preserveStage = $false
+    $custom = $false
+    $buildResult = $null
 
-    $sourceExecutable =
-        Join-Path $sourceDirectory 'Cprs.exe'
-
-    $testRoot =
-        'V:\TEST\EXE'
-
-    $testApplicationDirectory =
-        Join-Path $testRoot 'CPRS II'
-
-    $buildArchiveRoot =
-        Join-Path $testRoot 'Builds'
-
-    $deploymentEmailJobFlag = 'DEPL'
-
-    # -------------------------------------------------------------------------
-    # Validate TEST deployment root
-    # -------------------------------------------------------------------------
-
-    if (-not (
-        Test-Path `
-            -LiteralPath $testRoot `
-            -PathType Container
-    )) {
-        throw "CPRS TEST deployment root is not available: $testRoot"
-    }
-
-
-    # -------------------------------------------------------------------------
-    # Validate optional custom folder
-    # -------------------------------------------------------------------------
-
-    $isCustomFolder =
-        -not [string]::IsNullOrWhiteSpace($Folder)
-
-    if ($isCustomFolder) {
-
-        $Folder = $Folder.Trim()
-
-        if (
-            $Folder.Contains('\') -or
-            $Folder.Contains('/') -or
-            $Folder -in @('.', '..')
-        ) {
-            throw (
-                'Folder must be a folder name only. ' +
-                'Example: <folder>'
-            )
-        }
-
-        $invalidCharacters =
-            [System.IO.Path]::GetInvalidFileNameChars()
-
-        if ($Folder.IndexOfAny($invalidCharacters) -ge 0) {
-            throw "Invalid folder name: $Folder"
-        }
-
-        if ($Folder -in @('CPRS II', 'Builds')) {
-            throw (
-                "'$Folder' is reserved. " +
-                'Omit -Folder to deploy to CPRS II.'
-            )
-        }
-    }
-
-
-    # -------------------------------------------------------------------------
-    # Resolve destination
-    # -------------------------------------------------------------------------
-
-    if ($isCustomFolder) {
-        $destinationDirectory =
-            Join-Path $testRoot $Folder
-    }
-    else {
-        $destinationDirectory =
-            $testApplicationDirectory
-    }
-
-
-    # -------------------------------------------------------------------------
-    # Display requested operation
-    # -------------------------------------------------------------------------
-
-    Write-Host ''
-    Write-Host 'CPRS TEST Client Deployment' -ForegroundColor Cyan
-    Write-Host '===========================' -ForegroundColor Cyan
-    Write-Host ''
-
-    Write-Host "Source      : $sourceDirectory"
-    Write-Host "Destination : $destinationDirectory"
-
-    if ($WhatIfPreference) {
-        Write-Host 'Build       : WOULD BUILD' -ForegroundColor Yellow
-    }
-    elseif ($SkipBuild) {
-        Write-Host 'Build       : SKIPPED'
-    }
-    else {
-        Write-Host 'Build       : YES'
-    }
-
-    if ($isCustomFolder) {
-        Write-Host 'Archive     : NO - custom TEST folder'
-        Write-Host 'CPRS II     : NOT MODIFIED'
-    }
-    else {
-        Write-Host "Archive     : $buildArchiveRoot"
-        Write-Host 'CPRS II     : REPLACED'
-    }
-
-    Write-Host ''
-
-
-    # -------------------------------------------------------------------------
-    # WhatIf is a true preview.
-    #
-    # Do not build or modify any files.
-    # -------------------------------------------------------------------------
-
-    if ($WhatIfPreference) {
-
-        if (
-            Test-Path `
-                -LiteralPath $sourceExecutable `
-                -PathType Leaf
-        ) {
-            $previewVersion =
-                [System.Diagnostics.FileVersionInfo]::GetVersionInfo(
-                    $sourceExecutable
-                ).FileVersion
-
-            Write-Host "Existing local build version: $previewVersion"
-        }
-
-        if (
-            -not $isCustomFolder -and
-            (Test-Path `
-                -LiteralPath $testApplicationDirectory `
-                -PathType Container)
-        ) {
-            Write-Host ''
-            Write-Host (
-                "WHAT IF: Existing $testApplicationDirectory " +
-                'would be archived before replacement.'
-            )
-        }
-
-        Write-Host (
-            "WHAT IF: $sourceDirectory would be copied to " +
-            "$destinationDirectory"
+    function Get-BuildInfo {
+        param(
+            [Parameter(Mandatory)][string]$Path,
+            [switch]$ExcludeRootApplication
         )
 
-        Write-Host ''
-        Write-Host 'CPRS TEST deployment preview completed.' `
-            -ForegroundColor Yellow
-        Write-Host ''
+        if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+            throw "Build directory not found: $Path"
+        }
+        $exe = Join-Path $Path 'Cprs.exe'
+        if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            throw "Cprs.exe is missing: $exe"
+        }
+        $version = (Get-Item -LiteralPath $exe -ErrorAction Stop).VersionInfo.FileVersion
+        if ([string]::IsNullOrWhiteSpace($version)) {
+            throw "Cprs.exe has no readable file version: $exe"
+        }
 
-        return
-    }
+        $entries = [System.Collections.Generic.List[string]]::new()
+        $fileCount = 0
+        $byteCount = [long]0
+        $exeHash = $null
+        $items = @(Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction Stop)
 
-    $deploymentStart = Get-Date
-
-    # -------------------------------------------------------------------------
-    # Build unless -SkipBuild was requested
-    # -------------------------------------------------------------------------
-
-    if (-not $SkipBuild) {
-
-        Write-Host 'Building CPRS Release...' -ForegroundColor Cyan
-        Write-Host ''
-
-        Build-CprsRelease | Out-Host
-    }
-    else {
-        Write-Host 'Using existing CPRS Release build.' `
-            -ForegroundColor Yellow
-        Write-Host ''
-    }
-
-
-    # -------------------------------------------------------------------------
-    # Validate Release output
-    # -------------------------------------------------------------------------
-
-    if (-not (
-        Test-Path `
-            -LiteralPath $sourceExecutable `
-            -PathType Leaf
-    )) {
-        throw (
-            'CPRS Release executable was not found: ' +
-            $sourceExecutable
-        )
-    }
-
-    $versionInfo =
-        [System.Diagnostics.FileVersionInfo]::GetVersionInfo(
-            $sourceExecutable
-        )
-
-    $sourceVersion =
-        $versionInfo.FileVersion
-
-
-    # -------------------------------------------------------------------------
-    # Archive existing CPRS II
-    #
-    # Only normal CPRS II deployments archive.
-    # Custom folders NEVER touch CPRS II or Builds.
-    # -------------------------------------------------------------------------
-
-    $archiveDirectory = $null
-
-    if (
-        -not $isCustomFolder -and
-        (Test-Path `
-            -LiteralPath $testApplicationDirectory `
-            -PathType Container)
-    ) {
-
-        $currentFiles =
-            Get-ChildItem `
-                -LiteralPath $testApplicationDirectory `
-                -Force `
-                -ErrorAction Stop
-
-        if ($currentFiles.Count -gt 0) {
-
-            $currentExecutable =
-                Join-Path $testApplicationDirectory 'Cprs.exe'
-
-            $archiveVersion = 'unknown'
-            $archiveHash = 'unknown'
-
-            if (
-                Test-Path `
-                    -LiteralPath $currentExecutable `
-                    -PathType Leaf
-            ) {
-
-                $currentVersion =
-                    [System.Diagnostics.FileVersionInfo]::GetVersionInfo(
-                        $currentExecutable
-                    )
-
-                if (-not [string]::IsNullOrWhiteSpace(
-                    $currentVersion.FileVersion
-                )) {
-                    $archiveVersion =
-                        $currentVersion.FileVersion
-                }
-
-                $hash =
-                    Get-FileHash `
-                        -LiteralPath $currentExecutable `
-                        -Algorithm SHA256
-
-                $archiveHash =
-                    $hash.Hash.Substring(0, 7).ToLowerInvariant()
+        foreach ($item in $items) {
+            $relative = [System.IO.Path]::GetRelativePath($Path, $item.FullName).Replace('/', '\')
+            if ($ExcludeRootApplication -and $relative -ieq 'Cprs.application') {
+                continue
+            }
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Reparse point is not allowed in deployment: $($item.FullName)"
+            }
+            if ($item.PSIsContainer) {
+                $entries.Add("D|$relative")
+                continue
             }
 
-            $timestamp =
-                Get-Date -Format 'yyyyMMdd-HHmmss'
-
-            $archiveName =
-                "CPRS_v${archiveVersion}_build${timestamp}_${archiveHash}"
-
-            $archiveDirectory =
-                Join-Path $buildArchiveRoot $archiveName
-
-
-            Write-Host 'Archiving existing CPRS II build...' `
-                -ForegroundColor Cyan
-
-            if (-not (
-                Test-Path `
-                    -LiteralPath $buildArchiveRoot `
-                    -PathType Container
-            )) {
-                New-Item `
-                    -ItemType Directory `
-                    -Path $buildArchiveRoot `
-                    -Force `
-                    -ErrorAction Stop |
-                    Out-Null
+            $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+            $entries.Add("F|$relative|$($item.Length)|$hash")
+            $fileCount++
+            $byteCount += [long]$item.Length
+            if ($relative -ieq 'Cprs.exe') {
+                $exeHash = $hash
             }
-
-            New-Item `
-                -ItemType Directory `
-                -Path $archiveDirectory `
-                -Force `
-                -ErrorAction Stop |
-                Out-Null
-
-            Get-ChildItem `
-                -LiteralPath $testApplicationDirectory `
-                -Force `
-                -ErrorAction Stop |
-                Copy-Item `
-                    -Destination $archiveDirectory `
-                    -Recurse `
-                    -Force `
-                    -ErrorAction Stop
-
-            Write-Host "Archived to : $archiveDirectory" `
-                -ForegroundColor Green
-            Write-Host ''
-        }
-    }
-
-
-    # -------------------------------------------------------------------------
-    # Replace destination
-    # -------------------------------------------------------------------------
-
-    Write-Host 'Deploying CPRS build...' -ForegroundColor Cyan
-
-    if (
-        Test-Path `
-            -LiteralPath $destinationDirectory
-    ) {
-        Remove-Item `
-            -LiteralPath $destinationDirectory `
-            -Recurse `
-            -Force `
-            -ErrorAction Stop
-    }
-
-    New-Item `
-        -ItemType Directory `
-        -Path $destinationDirectory `
-        -Force `
-        -ErrorAction Stop |
-        Out-Null
-
-    Get-ChildItem `
-        -LiteralPath $sourceDirectory `
-        -Force `
-        -ErrorAction Stop |
-    Where-Object {
-        $_.Name -ne 'Cprs.application'
-    } |
-    Copy-Item `
-        -Destination $destinationDirectory `
-        -Recurse `
-        -Force `
-        -ErrorAction Stop
-
-
-    # -------------------------------------------------------------------------
-    # Verify deployed executable
-    # -------------------------------------------------------------------------
-
-    $deployedExecutable =
-        Join-Path $destinationDirectory 'Cprs.exe'
-
-    if (-not (
-        Test-Path `
-            -LiteralPath $deployedExecutable `
-            -PathType Leaf
-    )) {
-        throw (
-            'Deployment copy completed but Cprs.exe was not found: ' +
-            $deployedExecutable
-        )
-    }
-
-    # -------------------------------------------------------------------------
-    # Collect deployment statistics
-    # -------------------------------------------------------------------------
-
-    $deploymentEnd = Get-Date
-
-    $elapsed =
-        $deploymentEnd - $deploymentStart
-
-    $duration =
-        '{0:00}:{1:00}:{2:00}' -f `
-            [math]::Floor($elapsed.TotalHours),
-            $elapsed.Minutes,
-            $elapsed.Seconds
-
-    $deployedFiles = @(
-        Get-ChildItem `
-            -LiteralPath $destinationDirectory `
-            -File `
-            -Recurse `
-            -Force `
-            -ErrorAction Stop
-    )
-
-    $totalBytes =
-        (
-            $deployedFiles |
-                Measure-Object `
-                    -Property Length `
-                    -Sum
-        ).Sum
-
-    if ($null -eq $totalBytes) {
-        $totalBytes = 0
-    }
-
-    $deploymentSizeMB =
-        [math]::Round(
-            $totalBytes / 1MB,
-            2
-    )
-
-    # -------------------------------------------------------------------------
-    # Git information
-    # -------------------------------------------------------------------------
-
-    $repositoryRoot =
-        'C:\Development-CPRS\Cprs'
-
-    $gitBranch = 'UNKNOWN'
-    $gitCommit = 'UNKNOWN'
-
-    if (Get-Command git -ErrorAction SilentlyContinue) {
-
-        $branch =
-            & git -C $repositoryRoot branch --show-current 2>$null
-
-        if ($LASTEXITCODE -eq 0 -and $branch) {
-            $gitBranch = ([string]$branch).Trim()
         }
 
-        $commit =
-            & git -C $repositoryRoot rev-parse --short HEAD 2>$null
-
-        if ($LASTEXITCODE -eq 0 -and $commit) {
-            $gitCommit = ([string]$commit).Trim()
+        if (-not $exeHash) {
+            throw "Cprs.exe was not included in build manifest: $Path"
         }
-    }
-
-    # -------------------------------------------------------------------------
-    # Build deployment statistics
-    # -------------------------------------------------------------------------
-
-    $deploymentStatistics =
+        $entries.Sort([System.StringComparer]::OrdinalIgnoreCase)
         [pscustomobject]@{
-            DeploymentRoute   = 'LOCAL -> TEST'
-            SourceEnvironment = 'LOCAL'
-            TargetEnvironment = 'TEST'
-            Status            = 'SUCCESS'
-            DeploymentMessage = $Message
-            Version           = $sourceVersion
-            Build             = if ($SkipBuild) {
-                'SKIPPED - existing Release build used'
-            }
-            else {
-                'Release build completed'
-            }
-            GitBranch         = $gitBranch
-            GitCommit         = $gitCommit
-            FilesDeployed     = $deployedFiles.Count
-            DeploymentSizeMB  = $deploymentSizeMB
-            Started           = $deploymentStart.ToString(
-                'MM/dd/yyyy hh:mm:ss tt'
-            )
-            Completed         = $deploymentEnd.ToString(
-                'MM/dd/yyyy hh:mm:ss tt'
-            )
-            Duration          = $duration
-            Source            = $sourceDirectory
-            Destination       = $destinationDirectory
-            ArchiveRoot       = $buildArchiveRoot
-            ArchivedTo        = if ($archiveDirectory) {
-                $archiveDirectory
-            }
-            elseif ($isCustomFolder) {
-                'Not archived - custom TEST folder'
-            }
-            else {
-                'No previous build required archiving'
-            }
+            Files = $fileCount
+            Bytes = $byteCount
+            SizeMB = [math]::Round($byteCount / 1MB, 2)
+            Version = $version
+            SHA256 = $exeHash
+            Manifest = [string]::Join("`n", $entries)
         }
+    }
 
-    # -------------------------------------------------------------------------
-    # Email deployment statistics
-    # -------------------------------------------------------------------------
+    function Assert-Build {
+        param(
+            [Parameter(Mandatory)][string]$Path,
+            [Parameter(Mandatory)][psobject]$Expected,
+            [Parameter(Mandatory)][string]$Label
+        )
+        $actual = Get-BuildInfo -Path $Path
+        if ($actual.Version -ne $Expected.Version -or
+            $actual.Files -ne $Expected.Files -or
+            $actual.Bytes -ne $Expected.Bytes -or
+            $actual.SHA256 -ne $Expected.SHA256 -or
+            $actual.Manifest -cne $Expected.Manifest) {
+            throw "$Label verification failed (file paths, sizes, hashes, or version differ): $Path"
+        }
+        return $actual
+    }
+
+    function Move-DirectoryStrict {
+        param(
+            [Parameter(Mandatory)][string]$From,
+            [Parameter(Mandatory)][string]$To
+        )
+        if (-not (Test-Path -LiteralPath $From -PathType Container)) {
+            throw "Directory move source does not exist: $From"
+        }
+        if (Test-Path -LiteralPath $To) {
+            throw "Directory move destination already exists: $To"
+        }
+        [System.IO.Directory]::Move($From, $To)
+        if ((Test-Path -LiteralPath $From) -or
+            -not (Test-Path -LiteralPath $To -PathType Container)) {
+            throw "Directory move could not be verified: $From -> $To"
+        }
+    }
 
     try {
-        $deploymentEmailRecipients =
-            Get-CprsDeploymentEmailRecipients `
-                -JobFlag $deploymentEmailJobFlag
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+            throw "TEST root is unavailable: $root"
+        }
+        $custom = -not [string]::IsNullOrWhiteSpace($Folder)
+        if ($custom) {
+            $Folder = $Folder.Trim()
+            if ($Folder -in @('.', '..', 'CPRS II', 'Builds') -or
+                $Folder.StartsWith('_CPRS_', [System.StringComparison]::OrdinalIgnoreCase) -or
+                $Folder.Contains('\') -or $Folder.Contains('/') -or
+                $Folder.IndexOfAny([System.IO.Path]::GetInvalidFileNameChars()) -ge 0 -or
+                $Folder.EndsWith('.') -or
+                $Folder -match '^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)') {
+                throw "Invalid or reserved TEST folder: $Folder"
+            }
+        }
+        if ($TestMode -and -not $custom) {
+            throw 'TestMode requires -Folder and cannot target the active CPRS II folder.'
+        }
+        if ($ValidationFailurePoint -ne 'None' -and -not $TestMode) {
+            throw 'ValidationFailurePoint is permitted only with -TestMode.'
+        }
 
-        Send-CprsDeploymentEmail `
-            -Statistics $deploymentStatistics `
-            -Recipients $deploymentEmailRecipients
+        $destination = if ($custom) { Join-Path $root $Folder } else { Join-Path $root 'CPRS II' }
+        if ((Test-Path -LiteralPath $destination) -and
+            -not (Test-Path -LiteralPath $destination -PathType Container)) {
+            throw "TEST destination exists but is not a directory: $destination"
+        }
+
+        Write-Host "`nCPRS TEST CLIENT DEPLOYMENT" -ForegroundColor Cyan
+        Write-Host '==========================='
+        Write-Host "Source      : $source"
+        Write-Host "Destination : $destination"
+        Write-Host "Message     : $Message"
+        Write-Host "Build       : $(if ($SkipBuild) { 'SKIPPED' } else { 'YES' })"
+        Write-Host "Test Mode   : $TestMode"
+        Write-Host "Email       : $(if ($TestMode) { 'leon.mil@census.gov ONLY' } else { 'CCMAIL DEPL recipients' })"
+        Write-Host 'Cutover     : TRANSACTIONAL'
+        Write-Host 'Rollback    : ENABLED'
+
+        if ($WhatIfPreference) {
+            $exe = Join-Path $source 'Cprs.exe'
+            if (Test-Path -LiteralPath $exe -PathType Leaf) {
+                Write-Host "Existing Release version: $((Get-Item -LiteralPath $exe).VersionInfo.FileVersion)"
+            }
+            Write-Host "`nPREVIEW ONLY - NO FILESYSTEM CHANGES." -ForegroundColor Yellow
+            return
+        }
+        if (-not $PSCmdlet.ShouldProcess($destination, 'Build/stage/verify and deploy CPRS to TEST')) {
+            return
+        }
+
+        # A persistent lock FILE is deliberate: deleting it would create a race.
+        # Exclusive FileShare.None is enforced by the Windows/SMB file server.
+        try {
+            $lockStream = [System.IO.File]::Open(
+                $lockPath,
+                [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::None
+            )
+        }
+        catch [System.IO.IOException] {
+            throw 'Another TEST deployment is in progress, or the deployment lock is unavailable.'
+        }
+
+        if (-not $SkipBuild) {
+            Write-Host "`nBuilding CPRS Release..." -ForegroundColor Cyan
+            $buildResult = Build-CprsRelease -ErrorAction Stop
+            if ($null -eq $buildResult -or -not $buildResult.Version) {
+                throw 'CPRS Release build did not return a verified version.'
+            }
+            $buildResult | Out-Host
+        }
+
+        $expected = Get-BuildInfo -Path $source -ExcludeRootApplication
+        if ($buildResult -and $buildResult.Version -ne $expected.Version) {
+            throw 'Release version differs from the completed build result.'
+        }
+        $sourceItems = @(
+            Get-ChildItem -LiteralPath $source -Force -ErrorAction Stop |
+                Where-Object { $_.Name -ne 'Cprs.application' }
+        )
+        if ($sourceItems.Count -eq 0) {
+            throw 'Release directory contains no deployable items.'
+        }
+
+        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $id = [guid]::NewGuid().ToString('N').Substring(0, 8)
+        $safeName = (Split-Path $destination -Leaf) -replace '[^A-Za-z0-9._-]', '_'
+        $stage = Join-Path $root "_CPRS_STAGE_${safeName}_${stamp}_${id}"
+
+        Write-Host "`nStaging and verifying every build file..." -ForegroundColor Cyan
+        New-Item -ItemType Directory -Path $stage -ErrorAction Stop | Out-Null
+        $sourceItems | Copy-Item -Destination $stage -Recurse -Force -ErrorAction Stop
+        [void](Assert-Build -Path $stage -Expected $expected -Label 'Staging')
+        Write-Host 'STAGING VERIFIED' -ForegroundColor Green
+
+        $originalExisted = Test-Path -LiteralPath $destination -PathType Container
+        if ($originalExisted) {
+            $previous = Get-BuildInfo -Path $destination
+            if (-not (Test-Path -LiteralPath $builds -PathType Container)) {
+                New-Item -ItemType Directory -Path $builds -ErrorAction Stop | Out-Null
+            }
+            $safeVersion = $previous.Version -replace '[^A-Za-z0-9._-]', '_'
+            $shortHash = $previous.SHA256.Substring(0, 7).ToLowerInvariant()
+            $archiveName = if ($custom) {
+                "CPRS_${safeName}_v${safeVersion}_build${stamp}_${shortHash}_${id}"
+            }
+            else {
+                "CPRS_v${safeVersion}_build${stamp}_${shortHash}_${id}"
+            }
+            $archive = Join-Path $builds $archiveName
+            if (Test-Path -LiteralPath $archive) {
+                throw "Archive destination is already occupied: $archive"
+            }
+        }
+        elseif (Test-Path -LiteralPath $destination) {
+            throw "TEST destination is unexpectedly occupied: $destination"
+        }
+
+        if ($ValidationFailurePoint -eq 'AfterArchive' -and -not $originalExisted) {
+            throw 'AfterArchive validation requires an existing TEST validation folder.'
+        }
+
+        $cutoverStarted = $true
+        Write-Host "`nTEST CUTOVER" -ForegroundColor Cyan
+        if ($originalExisted) {
+            Move-DirectoryStrict -From $destination -To $archive
+            $archiveMoved = $true
+            [void](Assert-Build -Path $archive -Expected $previous -Label 'Archive')
+            Write-Host "ARCHIVED: $archive" -ForegroundColor Green
+        }
+        if ($ValidationFailurePoint -eq 'AfterArchive') {
+            throw 'SIMULATED FAILURE: after original destination was archived.'
+        }
+        if (Test-Path -LiteralPath $destination) {
+            throw "Destination unexpectedly occupied before activation: $destination"
+        }
+
+        Move-DirectoryStrict -From $stage -To $destination
+        $stageMoved = $true
+        if ($ValidationFailurePoint -eq 'AfterActivation') {
+            throw 'SIMULATED FAILURE: after the new build was activated.'
+        }
+        $deployed = Assert-Build -Path $destination -Expected $expected -Label 'Deployment'
+        Write-Host 'DEPLOYMENT VERIFIED' -ForegroundColor Green
     }
     catch {
-        Write-Warning (
-            'Deployment succeeded, but CCMAIL recipients could not be loaded: ' +
-            $_.Exception.Message
-        )
-    }
+        $failure = $_
+        $rollbackError = $null
+        if ($cutoverStarted) {
+            try {
+                # A strict move may have completed before its verification raised an error.
+                if ($originalExisted -and -not $archiveMoved -and $archive -and
+                    (Test-Path -LiteralPath $archive -PathType Container) -and
+                    -not (Test-Path -LiteralPath $destination)) {
+                    $archiveMoved = $true
+                }
+                if (-not $stageMoved -and $stage -and
+                    -not (Test-Path -LiteralPath $stage) -and
+                    (Test-Path -LiteralPath $destination -PathType Container)) {
+                    # The generated staging path has disappeared and destination
+                    # exists: with the exclusive deployment lock, it was activated.
+                    $stageMoved = $true
+                }
 
-    # -------------------------------------------------------------------------
-    # Final result
-    # -------------------------------------------------------------------------
+                if ($archiveMoved) {
+                    if (Test-Path -LiteralPath $destination) {
+                        if (-not $stageMoved) {
+                            throw 'An unexpected destination was found. The original archive is preserved.'
+                        }
+                        if (Test-Path -LiteralPath $stage) {
+                            throw 'Rollback staging path is occupied. The original archive is preserved.'
+                        }
+                        Move-DirectoryStrict -From $destination -To $stage
+                    }
+                    if (Test-Path -LiteralPath $destination) {
+                        throw 'Cannot restore archive because the original destination is occupied.'
+                    }
+                    Move-DirectoryStrict -From $archive -To $destination
+                    [void](Assert-Build -Path $destination -Expected $previous -Label 'Rollback')
+                }
+                elseif ($originalExisted) {
+                    [void](Assert-Build -Path $destination -Expected $previous -Label 'Original TEST')
+                }
+                else {
+                    if (Test-Path -LiteralPath $destination) {
+                        if (-not $stageMoved -or (Test-Path -LiteralPath $stage)) {
+                            throw 'Unexpected TEST destination. Automatic cleanup was blocked.'
+                        }
+                        Move-DirectoryStrict -From $destination -To $stage
+                    }
+                    if (Test-Path -LiteralPath $destination) {
+                        throw 'Rollback did not restore the original missing-destination state.'
+                    }
+                }
+                $rollbackSucceeded = $true
+            }
+            catch {
+                $rollbackError = $_.Exception.Message
+            }
+        }
 
-    Write-Host ''
-    Write-Host 'CPRS TEST deployment succeeded.' `
-        -ForegroundColor Green
-
-    Write-Host "Version     : $sourceVersion"
-    Write-Host "Destination : $destinationDirectory"
-
-    if ($archiveDirectory) {
-        Write-Host "Archived    : $archiveDirectory"
-    }
-
-    Write-Host ''
-
-    [pscustomobject]@{
-        Application    = 'CPRS'
-        Version        = $sourceVersion
-        Source         = $sourceDirectory
-        Destination    = $destinationDirectory
-        ArchivedTo     = $archiveDirectory
-        BuildSkipped   = [bool]$SkipBuild
-        CustomFolder   = if ($isCustomFolder) {
-            $Folder
+        $preserveStage = $cutoverStarted -and -not $rollbackSucceeded
+        Write-Host "`nCPRS TEST DEPLOYMENT STOPPED" -ForegroundColor Yellow
+        Write-Host '============================' -ForegroundColor Yellow
+        $reason = $failure.Exception.Message
+        if ($reason -like 'SIMULATED FAILURE:*') {
+            Write-Host "Reason: $reason" -ForegroundColor Yellow
+        }
+        elseif ($reason -match 'being used by another process|sharing violation|access.*denied|lock') {
+            Write-Host 'Reason: Deployment files are locked or unavailable.' -ForegroundColor Yellow
+            Write-Host 'Close any open CPRS instances or processes using these files.'
         }
         else {
-            $null
+            Write-Host "Reason: $reason" -ForegroundColor Yellow
         }
-        DeploymentTime = Get-Date
+        if (-not $cutoverStarted) {
+            Write-Host 'Cutover: NOT STARTED. Existing destination was not moved.'
+        }
+        elseif ($rollbackSucceeded) {
+            Write-Host 'Automatic rollback: VERIFIED' -ForegroundColor Green
+        }
+        else {
+            Write-Host 'Automatic rollback: NOT VERIFIED - manual review required.' -ForegroundColor Red
+            if ($rollbackError) {
+                Write-Host "Rollback issue: $rollbackError" -ForegroundColor Red
+            }
+        }
+        if ($archive -and (Test-Path -LiteralPath $archive)) {
+            Write-Host "Recovery archive: $archive"
+        }
+        if ($preserveStage -and $stage -and (Test-Path -LiteralPath $stage)) {
+            Write-Host "Recovery staging: $stage"
+        }
+        Write-Host 'Deployment email: NOT SENT'
+        Write-Host 'Status: FAILED' -ForegroundColor Yellow
+
+        if ($ThrowOnFailure) {
+            throw $failure
+        }
+        return [pscustomobject]@{
+            Application = 'CPRS'
+            Environment = 'TEST'
+            Status = 'FAILED'
+            Destination = $destination
+            Error = $reason
+            RollbackSucceeded = $rollbackSucceeded
+            RecoveryArchive = if ($archive -and (Test-Path -LiteralPath $archive)) { $archive } else { $null }
+            RecoveryStage = if ($preserveStage -and $stage -and (Test-Path -LiteralPath $stage)) { $stage } else { $null }
+            TestMode = [bool]$TestMode
+        }
+    }
+    finally {
+        if ($stage -and -not $preserveStage -and
+            (Test-Path -LiteralPath $stage -PathType Container)) {
+            try {
+                Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction Stop
+            }
+            catch {
+                Write-Warning "Could not remove temporary staging directory: $stage"
+            }
+        }
+        if ($lockStream) {
+            $lockStream.Dispose()
+        }
+    }
+
+    $end = Get-Date
+    $elapsed = $end - $start
+    $branch = 'UNKNOWN'
+    $commit = 'UNKNOWN'
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        $value = & git -C $repository branch --show-current 2>$null
+        if ($LASTEXITCODE -eq 0 -and $value) { $branch = ([string]$value).Trim() }
+        $value = & git -C $repository rev-parse --short HEAD 2>$null
+        if ($LASTEXITCODE -eq 0 -and $value) { $commit = ([string]$value).Trim() }
+    }
+
+    $statistics = [pscustomobject]@{
+        DeploymentRoute = 'LOCAL -> TEST'
+        SourceEnvironment = 'LOCAL'
+        TargetEnvironment = if ($custom) { "TEST/$Folder" } else { 'TEST' }
+        Status = 'SUCCESS'
+        DeploymentMessage = $Message
+        Version = $deployed.Version
+        Build = if ($SkipBuild) { 'SKIPPED - existing Release build used' } else { 'Release build completed' }
+        GitBranch = $branch
+        GitCommit = $commit
+        FilesDeployed = $deployed.Files
+        DeploymentSizeMB = $deployed.SizeMB
+        Started = $start.ToString('MM/dd/yyyy hh:mm:ss tt')
+        Completed = $end.ToString('MM/dd/yyyy hh:mm:ss tt')
+        Duration = '{0:00}:{1:00}:{2:00}' -f [math]::Floor($elapsed.TotalHours), $elapsed.Minutes, $elapsed.Seconds
+        Source = $source
+        Destination = $destination
+        ArchiveRoot = $builds
+        ArchivedTo = if ($archiveMoved) { $archive } else { 'No previous destination existed' }
+    }
+
+    try {
+        $recipients = if ($TestMode) {
+            @('leon.mil@census.gov')
+        }
+        else {
+            @(Get-CprsDeploymentEmailRecipients -JobFlag 'DEPL')
+        }
+        Send-CprsDeploymentEmail -Statistics $statistics -Recipients $recipients
+    }
+    catch {
+        Write-Warning "Deployment succeeded, but notification failed: $($_.Exception.Message)"
+    }
+
+    Write-Host "`nCPRS TEST DEPLOYMENT SUCCEEDED" -ForegroundColor Green
+    Write-Host "Version     : $($deployed.Version)"
+    Write-Host "Destination : $destination"
+    Write-Host "SHA256      : $($deployed.SHA256)"
+    Write-Host "Archived    : $(if ($archiveMoved) { $archive } else { 'NONE' })"
+
+    [pscustomobject]@{
+        Application = 'CPRS'
+        Environment = 'TEST'
+        Version = $deployed.Version
+        SHA256 = $deployed.SHA256
+        Source = $source
+        Destination = $destination
+        ArchivedTo = if ($archiveMoved) { $archive } else { $null }
+        BuildSkipped = [bool]$SkipBuild
+        CustomFolder = if ($custom) { $Folder } else { $null }
+        TestMode = [bool]$TestMode
+        Transactional = $true
+        RollbackEnabled = $true
+        DeploymentTime = $end
+        Status = 'SUCCESS'
     }
 }
 
